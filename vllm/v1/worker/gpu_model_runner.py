@@ -558,6 +558,8 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        # Non-last PP ranks have no drafter; isinstance checks tolerate None.
+        self.drafter = None
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -5019,7 +5021,7 @@ class GPUModelRunner(
             spec_config.use_eagle()
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
-        ):
+        ) and self.drafter is not None:
             assert isinstance(
                 self.drafter,
                 EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
@@ -5982,10 +5984,14 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -6889,9 +6895,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and self.drafter is not None
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -6943,9 +6953,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and self.drafter is not None
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -7125,10 +7139,35 @@ class GPUModelRunner(
                 # There may be a last group for layers without kv cache.
                 continue
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            import os as _os_v41dbg
+            if _os_v41dbg.environ.get("V41_KVDBG"):
+                _s = kv_cache_spec
+                _bs = getattr(_s, "block_size", None)
+                _sbs = getattr(_s, "storage_block_size", None)
+                _cr = getattr(_s, "compress_ratio", None)
+                _rp = getattr(_s, "real_page_size_bytes", None)
+                _pp = getattr(_s, "page_size_padded", None)
+                _pb = getattr(_s, "page_size_bytes", None)
+                print(
+                    f"[V41_KVDBG] gid={group.kv_cache_group_id} "
+                    f"kblk={kernel_block_size} spec={type(_s).__name__} "
+                    f"backend={type(attn_backend).__name__} "
+                    f"block={_bs} storage={_sbs} ratio={_cr} "
+                    f"real_page={_rp} padded={_pp} page_bytes={_pb} "
+                    f"layers={list(group.layer_names)[:3]}... n={len(group.layer_names)}",
+                    flush=True,
+                )
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
+                if _os_v41dbg.environ.get("V41_KVDBG"):
+                    print(
+                        f"[V41_KVDBG]   layer={layer_name} "
+                        f"raw_numel={raw_tensor.numel()} "
+                        f"num_blocks={raw_tensor.numel() // kv_cache_spec.page_size_bytes}",
+                        flush=True,
+                    )
                 packing = layer_packing.get(layer_name)
                 if packing is not None:
                     _, blk_stride = packing
@@ -7156,6 +7195,18 @@ class GPUModelRunner(
                         if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                         else self.cache_config.cache_dtype
                     )
+                    # MLA specs (e.g. DeepseekV4 fp8_ds_mla) encode their exact
+                    # on-disk KV layout in ``cache_dtype_str`` but leave
+                    # ``kv_quant_mode`` at NONE. ``get_kv_cache_shape`` keys off
+                    # this string, so pass it through directly; otherwise the
+                    # kv_quant_mode-derived "auto" selects the unquantized
+                    # (semantic head_size) shape and mis-sizes the page (512 vs
+                    # the real 584B fp8_ds_mla row).
+                    spec_cache_dtype_str = getattr(
+                        kv_cache_spec, "cache_dtype_str", None
+                    )
+                    if spec_cache_dtype_str not in (None, "auto"):
+                        layer_cache_dtype_str = spec_cache_dtype_str
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         shape_block_size,

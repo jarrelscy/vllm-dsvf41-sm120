@@ -540,7 +540,15 @@ def has_fbgemm_gpu() -> bool:
 
 
 def has_cutedsl() -> bool:
-    """Whether the optional `cutelass` package is available."""
+    """Whether the optional `cutelass` package is available.
+
+    ``VLLM_DISABLE_CUTEDSL=1`` forces this False so callers fall back to their
+    Triton paths. Needed on images where ``cutlass`` imports but the vLLM cute
+    utils (``vllm.vllm_flash_attn.cute``) are unavailable (e.g. FA C-extensions
+    not built), which would make the cutedsl kernels fail at import.
+    """
+    if os.environ.get("VLLM_DISABLE_CUTEDSL", "0") == "1":
+        return False
     return _has_module("cutlass")
 
 

@@ -40,15 +40,37 @@ class DSparkSpeculator(DFlashSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
-        # Anchor-as-first (N slots) unless the checkpoint uses the 1+N fill-in
-        # block, where the anchor is a separate bonus token.
-        self.sample_from_anchor = not getattr(
-            self.draft_model_config.hf_config, "dspark_bonus_anchor", False
+        # LOSSLESSNESS: default to the standard 1+N bonus layout, NOT
+        # anchor-as-first. Anchor-as-first (N query slots, where the anchor
+        # doubles as the first prediction) corrupts the KV cache: when a draft
+        # position is rejected, the KV written there holds the rejected draft
+        # token, and when the next block's anchor lands on that same position
+        # its self-KV is never rewritten. The anchor then attends to stale KV
+        # and its greedy argmax silently flips on borderline tokens (proven on
+        # SM120: dspark nspec=3 France/Primes diverge from the no-spec base at
+        # temp 0, always at the anchor's own position-0 logit, never a draft
+        # position). The 1+N bonus layout redecodes rejected positions cleanly
+        # via vLLM's known-lossless standard path, and is bit-exact with base.
+        # Anchor-as-first stays available for perf experiments via the env, but
+        # only when the checkpoint does not itself request the bonus layout.
+        import os as _os
+        self.sample_from_anchor = (
+            _os.environ.get("VLLM_DSPARK_ANCHOR_AS_FIRST") == "1"
+            and not getattr(
+                self.draft_model_config.hf_config, "dspark_bonus_anchor", False
+            )
         )
         if self.sample_from_anchor:
             self.num_query_per_req = self.num_speculative_steps
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
+
+        # A/B knob: when set, source draft base logits from the KV layout's own
+        # sample_indices (noise-aligned in the bonus layout). Default OFF -> use
+        # the reference anchor-first draft geometry (see _sample_sequential).
+        self._noise_aligned_sample = (
+            _os.environ.get("VLLM_DSPARK_NOISE_ALIGNED_SAMPLE") == "1"
+        )
 
         # DSpark consumes mean-pooled target aux hidden states at the target
         # layers, combined to hidden_size via main_proj. Store that combined
@@ -102,8 +124,28 @@ class DSparkSpeculator(DFlashSpeculator):
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
+        # DRAFT GEOMETRY (decoupled from the KV verify layout). DSpark is
+        # semi-autoregressive: block position k's backbone hidden predicts the
+        # token at position k+1 (next-token within the block), STARTING AT THE
+        # ANCHOR. So draft token 0 is sourced from the anchor position (query
+        # offset 0), draft token i from query offset i -- reference:
+        #   output_ids[:, i+1] = sample(logits[:, i] + markov_bias(output_ids[:, i]))
+        # with logits[:, 0] the ANCHOR's backbone hidden.
+        # The bonus KV layout's ``sample_indices`` instead point at the NOISE
+        # positions (query offsets 1..n_spec), which sources every draft token
+        # one position too late and collapses acceptance. Base logits must come
+        # from anchor-first offsets 0..n_spec-1; this is INTERNAL to the drafter
+        # and does not touch the target's (lossless) bonus verify. For the
+        # anchor-as-first KV layout ``_anchor_idx`` strides by n_spec, so these
+        # indices coincide with ``sample_indices`` there.
+        if self._noise_aligned_sample:  # legacy A/B path
+            base_idx = self.sample_indices[:num_sample]
+        else:
+            base_idx = (
+                self._anchor_idx[:num_reqs, None] + self._step_cols[None, :]
+            ).reshape(-1)
         # Per-(req, position) head hidden, ordered (req, step).
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        sample_hidden = head_hidden[base_idx]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]

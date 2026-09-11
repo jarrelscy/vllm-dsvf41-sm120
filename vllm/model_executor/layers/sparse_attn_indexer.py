@@ -40,6 +40,24 @@ logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
+# --- index_share_for_mtp_iteration (GLM-5.2 / DSA MTP draft) ---------------
+# When enabled by the V2 speculator around the MTP draft-decode loop
+# (VLLM_MTP_INDEX_SHARE=1 + hf_config.index_share_for_mtp_iteration), the
+# indexer op becomes a no-op for draft steps 1+: they reuse the top-k indices
+# the draft-extend (step-0) pass wrote into topk_indices_buffer, compacted to
+# rows [0:num_reqs). This flag is read at RUNTIME inside the eager body of a
+# splitting op, so it works under PIECEWISE cudagraphs without recompiles or
+# capture-order hazards (the op always runs eager between graph pieces).
+# Reference semantics: sgl-project/sglang #29654 / #29787 (anchor top-k on
+# the draft-extend step). Draft-only => lossless by rejection sampling.
+_MTP_DRAFT_REUSE_TOPK = False
+
+
+def set_mtp_draft_reuse_topk(enable: bool) -> None:
+    """Toggle indexer top-k reuse for MTP draft decode steps."""
+    global _MTP_DRAFT_REUSE_TOPK
+    _MTP_DRAFT_REUSE_TOPK = enable
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
@@ -356,6 +374,15 @@ def sparse_attn_indexer(
             skip_k_cache_insert,
             use_fp4_cache,
         )
+    if _MTP_DRAFT_REUSE_TOPK:
+        # index_share_for_mtp_iteration draft-decode step: reuse the anchored
+        # top-k already sitting in topk_indices_buffer rows [0:num_reqs)
+        # (written by the draft-extend pass, compacted by the speculator).
+        # Skipping the whole op (k-cache insert + buffer clear + logits +
+        # top-k) is safe: the skipped indexer-k entries are re-written by the
+        # next draft-extend pass before any in-context read, and the buffer
+        # rows must NOT be cleared so the reused indices survive.
+        return topk_indices_buffer
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata_narrowed.slot_mapping
@@ -521,12 +548,23 @@ def sparse_attn_indexer(
                 )
                 padded_q_scale = None
         else:
-            padded_q_quant_decode_tokens = q_quant[:num_decode_tokens].reshape(
-                decode_lens.shape[0], -1, *q_quant.shape[1:]
+            # `num_decode_tokens` can be padded up to a CUDA-graph capture size
+            # (PIECEWISE rounds the decode token buffer up to a captured size)
+            # while `decode_lens` tracks only the real requests, so inferring the
+            # per-token width via reshape(-1) from the padded count fails, e.g.
+            # 64 rows against 59 real requests. Derive the width from the
+            # (B, next_n) seq_lens and take exactly batch * next_n real rows,
+            # dropping any graph padding. When unpadded, real_rows ==
+            # num_decode_tokens, so this is byte-identical to the old reshape.
+            b = decode_lens.shape[0]
+            next_n = decode_metadata.seq_lens.shape[-1]
+            real_rows = b * next_n
+            padded_q_quant_decode_tokens = q_quant[:real_rows].reshape(
+                b, next_n, *q_quant.shape[1:]
             )
             if q_scale is not None:
-                padded_q_scale = q_scale[:num_decode_tokens].reshape(
-                    decode_lens.shape[0], -1, *q_scale.shape[1:]
+                padded_q_scale = q_scale[:real_rows].reshape(
+                    b, next_n, *q_scale.shape[1:]
                 )
             else:
                 padded_q_scale = None

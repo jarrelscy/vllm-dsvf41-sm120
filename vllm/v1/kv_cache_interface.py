@@ -329,6 +329,15 @@ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
         return
     actual_page_size = spec.real_page_size_bytes
     padded_page_size = round_up(actual_page_size, spec.alignment)
+    # Respect an already-set, larger page_size_padded. unify_kv_cache_spec_page_size
+    # pads a small attention page up to the group's max page via
+    # replace(spec, page_size_padded=max_page_size); that replace() re-runs
+    # __post_init__ here, and re-applying alignment would clobber the unified value
+    # back down to the alignment-rounded page. The max page is always >= the
+    # alignment-rounded page (it is the max across the group), so keep it.
+    existing = spec.page_size_padded
+    if existing is not None and existing >= padded_page_size:
+        return
     if padded_page_size != actual_page_size:
         object.__setattr__(spec, "page_size_padded", padded_page_size)
 
@@ -359,6 +368,13 @@ class TQFullAttentionSpec(FullAttentionSpec):
         return replace(merged, tq_slot_size=specs[0].tq_slot_size)
 
 
+# DeepSeek-V4 family versions that share the identical FlashMLA fp8_ds_mla
+# paged byte layout (448B NoPE + 128B RoPE + 8B fp8 scale = 584B/token). V4.1
+# reuses V4's cache format verbatim (see deepseek_v41/swa.py + attention.py),
+# so its page-size math and merge consistency are the same.
+_DEEPSEEK_V4_MLA_VERSIONS = ("deepseek_v4", "deepseek_v41")
+
+
 @dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
@@ -379,7 +395,7 @@ class MLAAttentionSpec(FullAttentionSpec):
     @property
     def real_page_size_bytes(self) -> int:
         if self.cache_dtype_str == "fp8_ds_mla":
-            if self.model_version == "deepseek_v4":
+            if self.model_version in _DEEPSEEK_V4_MLA_VERSIONS:
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 # head_size stays semantic (512); bytes are determined here.
                 return self.storage_block_size * 584
@@ -605,12 +621,15 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
+        if (
+            self.model_version in _DEEPSEEK_V4_MLA_VERSIONS
+            and self.cache_dtype_str == "fp8_ds_mla"
+        ):
             # DeepseekV4 FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B
             # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
             # the element-size formula below.
             return self.storage_block_size * 584
-        assert self.model_version in (None, "deepseek_v4"), (
+        assert self.model_version in (None, *_DEEPSEEK_V4_MLA_VERSIONS), (
             f"Unsupported model version: {self.model_version}"
         )
         return (

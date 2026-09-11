@@ -339,6 +339,35 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        # v41 tags its checkpoint quant_method as plain "fp8"; rewrite it to the
+        # deepseek_v4_fp8 method (identical quant math, shared with v4) so the
+        # direct-name resolution in ModelConfig picks the DeepSeek FP8 path.
+        # Mirrors DeepseekV4ForCausalLMConfig but keys on the v41 model types.
+        quant_config = getattr(model_config.hf_config, "quantization_config", None)
+        if quant_config is not None and quant_config.get("quant_method") == "fp8":
+            model_type = getattr(model_config.hf_config, "model_type", None)
+            if model_type in ("deepseek_v41", "deepseek_v41_text"):
+                model_config.hf_config.quantization_config["quant_method"] = (
+                    "deepseek_v4_fp8"
+                )
+
+        hf_text_quant_config = getattr(
+            model_config.hf_text_config, "quantization_config", None
+        )
+        if (
+            hf_text_quant_config is not None
+            and hf_text_quant_config.get("quant_method") == "fp8"
+        ):
+            model_type = getattr(model_config.hf_text_config, "model_type", None)
+            if model_type in ("deepseek_v41", "deepseek_v41_text"):
+                model_config.hf_text_config.quantization_config["quant_method"] = (
+                    "deepseek_v4_fp8"
+                )
+
+
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -813,6 +842,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
+    "DeepseekV41ForCausalLM": DeepseekV41ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501

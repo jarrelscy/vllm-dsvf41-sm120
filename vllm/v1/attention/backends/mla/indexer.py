@@ -167,6 +167,60 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
         return [256]
 
 
+class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    """v41 indexer paged-MQA-logits kernel (DeepGEMM, compiled ._C) HARD-asserts
+    block_kv == 64 exactly. block_kv is the pooled storage dim per page =
+    logical block_size // compress_ratio. v41 mixes ratio-1 and ratio-2 indexer
+    layers, so the two groups use DIFFERENT logical block sizes to land on the
+    same storage 64: ratio-1 -> block 64, ratio-2 -> block 128 (see
+    DeepseekV41IndexerCache.get_kv_cache_spec). We therefore advertise BOTH 64
+    and 128 as directly-supported kernel block sizes so each group's block_size
+    is honored in select_common_block_size Case 1 with NO virtual-block split --
+    a split would run copy_with_new_block_size(64) on the ratio-2 spec and
+    re-pool it back down to storage 32, re-triggering the assert. v4's plain
+    [256] would leave 64/128 with no common divisor and raise 'No common block
+    size'.
+
+    Because v41 pins the indexer block at 64 (see DeepseekV41IndexerCache) while
+    the main compressed-MLA cache stays at 256, the indexer page is smaller than
+    the model's max page. ``unify_kv_cache_spec_page_size`` would otherwise GROW
+    the indexer block back to 256 (re-inflating storage past DeepGEMM's limit) or
+    raise. We instead opt into physical-page PADDING by advertising a
+    num-blocks-first layered stride order, so ``indexes_kv_by_block_stride`` is
+    True: the padded page keeps its logical block_size 64 and is read through the
+    runtime block stride (``fused_kv_cache.stride(0)``), which the DeepGEMM kernel
+    honors (csrc attention.hpp: kv_cache_stride_bytes = fused_kv_cache.stride(0),
+    inner strides stay contiguous). Padding lands at the end of each page, so the
+    kernel's stride(1)==head_dim_with_sf / stride(3)==1 asserts still hold."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "DEEPSEEK_V41_INDEXER"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # Both v41 indexer logical block sizes: ratio-1 -> 64, ratio-2 -> 128.
+        # Listed as explicit ints so each is a Case-1 direct match (no split).
+        return [64, 128]
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        # Base v32/v4 indexer returns the identity permutation, which keeps the
+        # num_layers axis outermost and signals "no block-stride padding". v41
+        # needs padding (indexer block 64 < MLA block 256), so move num_blocks to
+        # the outermost physical position: for the layered logical shape
+        # (num_layers, num_blocks, block_size, head_size) return (1, 0, 2, 3) so
+        # physical layout is (num_blocks, num_layers, block_size, head_size). Then
+        # backend.indexes_kv_by_block_stride() -> layered[0] != 0 -> True. The
+        # non-layered order stays identity so a single page is contiguous
+        # (block_size dim keeps its logical stride; only stride(0) grows on pad).
+        if include_num_layers_dimension:
+            return (1, 0, 2, 3)
+        return (0, 1, 2)
+
+
 @dataclass
 class DeepseekV32IndexerPrefillChunkMetadata:
     block_table: torch.Tensor

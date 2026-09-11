@@ -95,11 +95,26 @@ class SpeculativeConfig:
     If using `ngram` method, the related configuration `prompt_lookup_max` and
     `prompt_lookup_min` should be considered."""
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
-    """The degree of the tensor parallelism for the draft model. Can only be 1
-    or the same as the target model's tensor parallel size."""
+    """The degree of the tensor parallelism for the draft model. Can only be 1,
+    the same as the target model's tensor parallel size, or -- when the target
+    runs with pipeline parallelism and TP=1 -- the target's pipeline_parallel_size
+    (the "orthogonal draft-TP over PP ranks" mode, see draft_tp_over_pp)."""
     tensor_parallel_size: int | None = None
     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
     warn users when they mistakenly provide the wrong argument."""
+
+    draft_tp_over_pp: bool = Field(default=False)
+    """[EXPERIMENTAL] When True, the draft model runs Tensor-Parallel across the
+    exact set of ranks that the target model uses for Pipeline Parallelism
+    (draft TP == target PP), while the target keeps running Pipeline Parallel.
+
+    Motivation: a dense-MHA draft (e.g. DSpark) placed whole on the last PP rank
+    keeps an UNSHARDED KV cache (~tens of GiB at long context) which OOMs at 1M
+    context. Sharding the draft's KV/weights TP-wise across all PP ranks makes it
+    ~1/pp the size per rank, so target-PP(1M) + draft fits.
+
+    Set automatically when draft_tensor_parallel_size == target pipeline_parallel_size
+    and target tensor_parallel_size == 1. See TP_DRAFT_PP_FINDINGS.md."""
 
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None
@@ -336,6 +351,17 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
+            )
+        if hf_config.model_type in ("deepseek_v41", "deepseek_v41_vision"):
+            # DeepSeek-V4.1-Flash ships 3 MTP (num_nextn_predict) layers inside
+            # the target checkpoint; select the V41-specific MTP draft class
+            # (DeepSeekV41MTP) whose forward already does e_/h_proj input fusion
+            # + HC-stream deferred-pre collapse. num_nextn_predict_layers is
+            # flattened from text_config by DeepseekV41Config (default 3).
+            hf_config.model_type = "deepseek_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["DeepSeekV41MTPModel"]}
             )
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
@@ -842,12 +868,27 @@ class SpeculativeConfig:
                 if self.method == "dspark" and (
                     "Qwen3DSparkModel" not in self.draft_model_config.architectures
                 ):
-                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
-                    # and its weights ship in the target checkpoint.
-                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
-                    self.draft_model_config.hf_config.architectures = [
-                        "DSparkDraftModel"
-                    ]
+                    # DSpark reuses the target's own config + ships its draft
+                    # weights inside the target checkpoint (mtp.*). Pick the
+                    # arch-specific DSpark draft class. Detect via the TARGET
+                    # config's model_type (the draft config's model_type was
+                    # already rewritten to "deepseek_mtp" by hf_config_override).
+                    tgt_mt = getattr(
+                        self.target_model_config.hf_config, "model_type", ""
+                    )
+                    if tgt_mt in ("deepseek_v41", "deepseek_v41_vision"):
+                        # DeepSeek-V4.1-Flash: v41-specific DSpark draft
+                        # (o-LoRA / HC / sparse-MLA aware).
+                        self.draft_model_config.hf_config.model_type = "deepseek_v41"
+                        self.draft_model_config.hf_config.architectures = [
+                            "DSparkV41DraftModel"
+                        ]
+                    else:
+                        # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config.
+                        self.draft_model_config.hf_config.model_type = "deepseek_v4"
+                        self.draft_model_config.hf_config.architectures = [
+                            "DSparkDraftModel"
+                        ]
                     self.update_arch_()
 
                 if self.method in ("dflash", "dspark"):
@@ -868,10 +909,15 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method != "dspark"
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
-                        # Ensure divisibility for MTP module reuse.
+                        # Ensure divisibility for MTP module reuse. DSpark drafts
+                        # the whole block in ONE parallel backbone pass (no per-
+                        # token MTP-module reuse), so num_speculative_tokens is a
+                        # free block width -- it need not divide n_predict (which
+                        # for DSpark counts draft DECODER layers, not tokens).
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"
@@ -891,6 +937,17 @@ class SpeculativeConfig:
                     )
                 )
 
+                # Detect the experimental "orthogonal draft-TP over PP ranks"
+                # mode: target is pure-PP (tp==1, pp>1) and the draft's TP equals
+                # the target's PP degree.
+                tpc = self.target_parallel_config
+                self.draft_tp_over_pp = (
+                    tpc.tensor_parallel_size == 1
+                    and tpc.pipeline_parallel_size > 1
+                    and self.draft_tensor_parallel_size
+                    == tpc.pipeline_parallel_size
+                )
+
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,
@@ -901,7 +958,9 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        draft_tp_over_pp=self.draft_tp_over_pp,
                     )
                 )
         return self
@@ -1016,9 +1075,29 @@ class SpeculativeConfig:
             1,
             target_parallel_config.tensor_parallel_size,
         ):
+            # EXPERIMENTAL: "orthogonal draft-TP over PP ranks". If the target
+            # runs pipeline-parallel with TP=1, the draft may run TP across the
+            # exact PP rank set (draft_tp == target pipeline_parallel_size). This
+            # shards a dense draft's KV/weights across all ranks so long-context
+            # target-PP + draft fits in memory. See TP_DRAFT_PP_FINDINGS.md.
+            pp = target_parallel_config.pipeline_parallel_size
+            if (
+                target_parallel_config.tensor_parallel_size == 1
+                and pp > 1
+                and speculative_draft_tensor_parallel_size == pp
+            ):
+                logger.info(
+                    "Enabling EXPERIMENTAL draft-TP-over-PP: draft runs TP=%d "
+                    "across the target's %d PP ranks.",
+                    speculative_draft_tensor_parallel_size,
+                    pp,
+                )
+                return speculative_draft_tensor_parallel_size
             raise ValueError(
                 f"{speculative_draft_tensor_parallel_size=} cannot be "
-                f"other value than 1 or target model tensor_parallel_size"
+                f"other value than 1 or target model tensor_parallel_size "
+                f"(or, experimentally, the target pipeline_parallel_size when "
+                f"target tensor_parallel_size==1)"
             )
         return speculative_draft_tensor_parallel_size
 
@@ -1044,13 +1123,25 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        draft_tp_over_pp: bool = False,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
+
+        In the experimental "orthogonal draft-TP over PP ranks" mode the draft is
+        NOT pipelined: it runs TP across the exact rank set the target uses for
+        PP. So the draft's own ParallelConfig is pp=1, tp=draft_tp. (The draft-TP
+        process group is built over the target's PP ranks at runtime; see
+        parallel_state.init_draft_tp_group.)
         """
+        draft_pp = (
+            1
+            if draft_tp_over_pp
+            else target_parallel_config.pipeline_parallel_size
+        )
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=draft_pp,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
@@ -1109,9 +1200,18 @@ class SpeculativeConfig:
             )
 
         if self.draft_model_config:
-            self.draft_model_config.verify_with_parallel_config(
-                self.draft_parallel_config
-            )
+            draft_parallel_config = self.draft_parallel_config
+            if (
+                self.method == "dspark"
+                and draft_parallel_config.pipeline_parallel_size > 1
+            ):
+                # DSpark's drafter is built as a local (non-partitioned) module on
+                # the last pipeline stage and does not participate in pipeline
+                # parallelism, so verify it as pp_size=1 (the target propagates the
+                # aux hidden states down the pipeline).
+                draft_parallel_config = copy.copy(draft_parallel_config)
+                draft_parallel_config.pipeline_parallel_size = 1
+            self.draft_model_config.verify_with_parallel_config(draft_parallel_config)
 
         if self.use_heterogeneous_vocab and not self.uses_draft_model():
             raise ValueError(

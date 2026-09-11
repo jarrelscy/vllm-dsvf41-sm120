@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -627,9 +628,30 @@ class Attention(nn.Module, AttentionLayerBase):
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
         if self.sliding_window is not None:
-            assert not vllm_config.model_config.use_mla, (
+            # model_config.use_mla is a GLOBAL flag (True if ANY layer is MLA,
+            # e.g. an MLA target with a non-MLA speculative draft). This
+            # Attention class always builds a non-MLA backend (use_mla=False
+            # above), so gate on THIS layer's actual backend: a non-MLA layer
+            # (e.g. a windowed DSpark draft) may use a sliding window even when
+            # the target model uses MLA.
+            assert "MLA" not in self.attn_backend.get_name().upper(), (
                 "MLA is not supported for slidingwindow"
             )
+            if os.environ.get("VLLM_DSPARK_DRAFT_SWA"):
+                # Windowed DSpark draft alongside an MLA target: use a small
+                # (block_size=1) REAL page so it stays <= the MLA target page,
+                # then let the multi-group builder pad it up to the MLA page.
+                # Do NOT adopt the (much larger) hybrid-quant skip shared page,
+                # which would exceed the MLA page and break grouping.
+                return SlidingWindowSpec(
+                    block_size=1,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=quant_mode,
+                    sliding_window=self.sliding_window,
+                )
             # SW chooses its own block_size, decoupled from the user's
             # ``--block-size`` (which only constrains primary attention).
             # When this SW layer is a padded spec (skip-quant: its page is

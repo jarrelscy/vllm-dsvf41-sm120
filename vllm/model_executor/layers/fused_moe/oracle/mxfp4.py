@@ -1555,6 +1555,51 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
+        # DeepSeek-V4.1-Flash native-FP4 experts on SM120 (matches sglang's
+        # --moe-runner-backend flashinfer_mxfp4). Weights stay bit-native MXFP4;
+        # only a layout permutation + block-scale interleave is applied, so this
+        # is weight-lossless. Activations are dynamically quantized to MXFP8 by
+        # the quant-config (same recipe as the proven sglang baseline).
+        #
+        # DeepSeek stores w13 contiguous as [w1(gate); w3(up)] with no bias.
+        # The FlashInfer CUTLASS SwiGLU kernel expects contiguous [w3(up);
+        # w1(gate)] (identical end-format to the gpt-oss CUTLASS branch, which
+        # de-interleaves first because ITS checkpoint is interleaved — DeepSeek
+        # is already un-interleaved, so a single half-swap suffices).
+        from flashinfer import block_scale_interleave
+
+        w13_weight = w13_weight.data
+        w2_weight = w2_weight.data
+        w13_weight_scale = w13_weight_scale.data
+        w2_weight_scale = w2_weight_scale.data
+
+        w1_w = w13_weight[:, :intermediate_size, :]
+        w3_w = w13_weight[:, intermediate_size:, :]
+        w13_weight_swapped = torch.cat([w3_w, w1_w], dim=1).contiguous()
+
+        w1_s = w13_weight_scale[:, :intermediate_size, :]
+        w3_s = w13_weight_scale[:, intermediate_size:, :]
+        w13_scale_swapped = torch.cat([w3_s, w1_s], dim=1).contiguous()
+
+        orig_shape = w13_scale_swapped.shape
+        w13_scale_interleaved = block_scale_interleave(
+            w13_scale_swapped.view(torch.uint8)
+        ).reshape(orig_shape)
+
+        orig_shape2 = w2_weight_scale.shape
+        w2_scale_interleaved = block_scale_interleave(
+            w2_weight_scale.view(torch.uint8)
+        ).reshape(orig_shape2)
+
+        return (
+            w13_weight_swapped,
+            w2_weight,
+            w13_scale_interleaved,
+            w2_scale_interleaved,
+            w13_bias,
+            w2_bias,
+        )
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
@@ -1609,13 +1654,18 @@ def make_mxfp4_moe_quant_config(
         )
     elif mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
         # CUTLASS kernel expects swizzled mxfp8 activation scales.
+        # SwiGLU alpha/beta: preserve an explicitly-supplied gpt-oss SwiGLU-OAI
+        # value (alpha=1.702, beta=1.0); otherwise default to the plain
+        # SiLU-SwiGLU convention (alpha=1.0, beta=0.0) used by DeepSeek-V4.1,
+        # whose oracle quant path does not pass these. Without this the kernel
+        # would fall back to the gpt-oss defaults and produce garbage output.
         return mxfp4_mxfp8_moe_quant_config(
             w1_bias=w1_bias,
             w2_bias=w2_bias,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_beta=gemm1_beta,
+            gemm1_alpha=gemm1_alpha if gemm1_alpha is not None else 1.0,
+            gemm1_beta=gemm1_beta if gemm1_beta is not None else 0.0,
             gemm1_clamp_limit=swiglu_limit,
             is_scale_swizzled=True,
         )
