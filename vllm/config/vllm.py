@@ -1124,6 +1124,8 @@ class VllmConfig:
                 in (
                     "DeepseekV4ForCausalLM",
                     "DeepSeekV4MTPModel",
+                    "DeepseekV41ForCausalLM",
+                    "DeepSeekV41MTPModel",
                     "MiniMaxM3SparseForCausalLM",
                     "MiniMaxM3SparseForConditionalGeneration",
                 )

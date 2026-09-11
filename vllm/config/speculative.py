@@ -352,6 +352,17 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
             )
+        if hf_config.model_type in ("deepseek_v41", "deepseek_v41_vision"):
+            # DeepSeek-V4.1-Flash ships 3 MTP (num_nextn_predict) layers inside
+            # the target checkpoint; select the V41-specific MTP draft class
+            # (DeepSeekV41MTP) whose forward already does e_/h_proj input fusion
+            # + HC-stream deferred-pre collapse. num_nextn_predict_layers is
+            # flattened from text_config by DeepseekV41Config (default 3).
+            hf_config.model_type = "deepseek_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["DeepSeekV41MTPModel"]}
+            )
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
         if hf_config.model_type == "pangu_ultra_moe_mtp":
@@ -857,12 +868,27 @@ class SpeculativeConfig:
                 if self.method == "dspark" and (
                     "Qwen3DSparkModel" not in self.draft_model_config.architectures
                 ):
-                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
-                    # and its weights ship in the target checkpoint.
-                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
-                    self.draft_model_config.hf_config.architectures = [
-                        "DSparkDraftModel"
-                    ]
+                    # DSpark reuses the target's own config + ships its draft
+                    # weights inside the target checkpoint (mtp.*). Pick the
+                    # arch-specific DSpark draft class. Detect via the TARGET
+                    # config's model_type (the draft config's model_type was
+                    # already rewritten to "deepseek_mtp" by hf_config_override).
+                    tgt_mt = getattr(
+                        self.target_model_config.hf_config, "model_type", ""
+                    )
+                    if tgt_mt in ("deepseek_v41", "deepseek_v41_vision"):
+                        # DeepSeek-V4.1-Flash: v41-specific DSpark draft
+                        # (o-LoRA / HC / sparse-MLA aware).
+                        self.draft_model_config.hf_config.model_type = "deepseek_v41"
+                        self.draft_model_config.hf_config.architectures = [
+                            "DSparkV41DraftModel"
+                        ]
+                    else:
+                        # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config.
+                        self.draft_model_config.hf_config.model_type = "deepseek_v4"
+                        self.draft_model_config.hf_config.architectures = [
+                            "DSparkDraftModel"
+                        ]
                     self.update_arch_()
 
                 if self.method in ("dflash", "dspark"):
@@ -883,10 +909,15 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method != "dspark"
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
-                        # Ensure divisibility for MTP module reuse.
+                        # Ensure divisibility for MTP module reuse. DSpark drafts
+                        # the whole block in ONE parallel backbone pass (no per-
+                        # token MTP-module reuse), so num_speculative_tokens is a
+                        # free block width -- it need not divide n_predict (which
+                        # for DSpark counts draft DECODER layers, not tokens).
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"

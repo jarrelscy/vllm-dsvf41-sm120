@@ -312,6 +312,17 @@ def _reshape_kv_cache(
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                     else cache_dtype
                 )
+                # Packed MLA layouts (e.g. DeepSeek ``fp8_ds_mla``, 584B/token)
+                # are carried in ``cache_dtype_str``, not ``kv_quant_mode`` (which
+                # stays NONE for them). The gpu_model_runner allocation path
+                # already honors this; mirror it here so the DSpark/gpu worker
+                # path builds the packed page shape rather than the 512-wide
+                # "auto" latent shape the SM120 sparse-MLA kernel rejects.
+                spec_cache_dtype_str = getattr(
+                    kv_cache_spec, "cache_dtype_str", None
+                )
+                if spec_cache_dtype_str not in (None, "auto"):
+                    layer_cache_dtype = spec_cache_dtype_str
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,

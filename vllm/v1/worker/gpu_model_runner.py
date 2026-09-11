@@ -7139,10 +7139,35 @@ class GPUModelRunner(
                 # There may be a last group for layers without kv cache.
                 continue
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            import os as _os_v41dbg
+            if _os_v41dbg.environ.get("V41_KVDBG"):
+                _s = kv_cache_spec
+                _bs = getattr(_s, "block_size", None)
+                _sbs = getattr(_s, "storage_block_size", None)
+                _cr = getattr(_s, "compress_ratio", None)
+                _rp = getattr(_s, "real_page_size_bytes", None)
+                _pp = getattr(_s, "page_size_padded", None)
+                _pb = getattr(_s, "page_size_bytes", None)
+                print(
+                    f"[V41_KVDBG] gid={group.kv_cache_group_id} "
+                    f"kblk={kernel_block_size} spec={type(_s).__name__} "
+                    f"backend={type(attn_backend).__name__} "
+                    f"block={_bs} storage={_sbs} ratio={_cr} "
+                    f"real_page={_rp} padded={_pp} page_bytes={_pb} "
+                    f"layers={list(group.layer_names)[:3]}... n={len(group.layer_names)}",
+                    flush=True,
+                )
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
+                if _os_v41dbg.environ.get("V41_KVDBG"):
+                    print(
+                        f"[V41_KVDBG]   layer={layer_name} "
+                        f"raw_numel={raw_tensor.numel()} "
+                        f"num_blocks={raw_tensor.numel() // kv_cache_spec.page_size_bytes}",
+                        flush=True,
+                    )
                 packing = layer_packing.get(layer_name)
                 if packing is not None:
                     _, blk_stride = packing

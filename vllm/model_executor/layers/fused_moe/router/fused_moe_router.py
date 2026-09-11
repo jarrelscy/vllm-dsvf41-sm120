@@ -18,6 +18,12 @@ class FusedMoERouter(ABC):
     def __init__(self, eplb_state: EplbLayerState | None = None):
         self._routing_replay_out: torch.Tensor | None = None
         self.eplb_state = eplb_state
+        # Optional externally-precomputed (topk_weights, topk_ids) override.
+        # When set (non-captured forwards only, e.g. DeepSeek-V4.1 image-span
+        # prefills that need per-token bias_vl routing the in-kernel router
+        # cannot express), select_experts returns it verbatim instead of
+        # running the router. Callers must reset it to None in a finally block.
+        self._precomputed_topk: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @abstractmethod
     def set_capture_fn(
@@ -64,12 +70,20 @@ class FusedMoERouter(ABC):
             plain MoE implementations without redundant experts.
         """
 
-        topk_weights, topk_ids = self._select_experts(
-            hidden_states,
-            router_logits,
-            topk_indices_dtype=topk_indices_dtype,
-            input_ids=input_ids,
-        )
+        if self._precomputed_topk is not None:
+            # Externally-precomputed routing (e.g. per-token bias_vl for image
+            # spans). Match the dtype the kernel expects; text rows are already
+            # identical to the router's own output.
+            topk_weights, topk_ids = self._precomputed_topk
+            if topk_indices_dtype is not None and topk_ids.dtype != topk_indices_dtype:
+                topk_ids = topk_ids.to(topk_indices_dtype)
+        else:
+            topk_weights, topk_ids = self._select_experts(
+                hidden_states,
+                router_logits,
+                topk_indices_dtype=topk_indices_dtype,
+                input_ids=input_ids,
+            )
 
         # Write routing data for non-monolithic path (Triton, etc.)
         # (set by bind_routing_capture_to_model during capturer init)

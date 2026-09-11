@@ -127,11 +127,27 @@ class DeepseekV4FP8Config(Fp8Config):
         ):
             return None
         model_type = getattr(hf_config, "model_type", None)
-        if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
+        # v41 shares this identical quant math (the v41 config class is a
+        # byte-for-byte clone but is not registered in the global quant table,
+        # so the registered v4 config must claim v41 model types here too).
+        # This override reads the live hf_config, sidestepping the frozen
+        # model_arch_config snapshot that still carries quant_method="fp8".
+        if (
+            model_type in ("deepseek_v4", "deepseek_v41", "deepseek_v41_text")
+            or user_quant == "deepseek_v4_fp8"
+        ):
             return "deepseek_v4_fp8"
         return None
 
     def get_quant_method(self, layer, prefix):
+        import os as _os, sys as _sys
+        if _os.environ.get("DSV41_QDBG") == "1":
+            _sys.stderr.write(
+                f"[QDBG] get_quant_method cls={type(self).__name__} "
+                f"prefix={prefix!r} is_routed={isinstance(layer, RoutedExperts)} "
+                f"expert_dtype={self.expert_dtype!r} moe_algo={self.moe_quant_algo!r}\n"
+            )
+            _sys.stderr.flush()
         if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
                 prefix=prefix,

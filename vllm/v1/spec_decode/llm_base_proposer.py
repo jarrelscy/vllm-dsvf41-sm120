@@ -1009,8 +1009,13 @@ class SpecDecodeBaseProposer:
             # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
             # norm hidden, so its forward returns (logit_hidden,
             # recycle_hidden). Other MTP families return a single tensor.
-            return "DeepSeekMTPModel" in (
-                self.draft_model_config.hf_config.architectures or []
+            # DeepSeekV41MTPModel does the same: its forward returns
+            # (dense_logit_hidden, flat_recycle_hidden) -- see
+            # deepseek_v41/nvidia/mtp.py DeepSeekV41MultiTokenPredictorLayer.forward.
+            tuple_archs = ("DeepSeekMTPModel", "DeepSeekV41MTPModel")
+            return any(
+                a in tuple_archs
+                for a in (self.draft_model_config.hf_config.architectures or [])
             )
         return self.method not in ("mtp", "draft_model", "dflash")
 

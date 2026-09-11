@@ -293,6 +293,17 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
+    @staticmethod
+    def _classify_layer_type(compress_ratio: int) -> str:
+        """Map a compress_ratio to its FlashMLA tile-scheduler layer type.
+
+        Overridable seam: v4 keeps the {1,4,128} taxonomy; the DeepseekV41
+        subclass overrides this to admit ratios {0,1,2} without touching v4
+        behavior. The default delegates to the module-level classifier, so v4
+        dispatch is byte-for-byte unchanged.
+        """
+        return _layer_type_for(compress_ratio)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
@@ -331,7 +342,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         compress_ratios = getattr(hf_config, "compress_ratios", None) or [1]
         self._layer_types: set[str] = set()
         for ratio in compress_ratios:
-            self._layer_types.add(_layer_type_for(int(ratio)))
+            self._layer_types.add(self._classify_layer_type(int(ratio)))
 
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_indices = torch.zeros(

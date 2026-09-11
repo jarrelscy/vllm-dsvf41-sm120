@@ -21,12 +21,22 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # so it cannot use the target's MLA-specific KV cache dtype (e.g.
     # ``fp8_ds_mla``). Give the draft its own bf16 ("auto") KV cache — it is tiny
     # (few layers, head_size 64) so the memory cost is negligible.
+    # The DeepSeek-V4.1 DSpark draft is itself an MLA model that shares the
+    # target's ``fp8_ds_mla`` KV-cache layout (real deepseek_v41 decoder layers),
+    # so it must KEEP the target cache dtype rather than fall back to bf16.
+    draft_archs = getattr(draft_model_config.hf_config, "architectures", []) or []
+    draft_is_mla = any("V41" in a for a in draft_archs)
     draft_cache_config = vllm_config.cache_config
-    if draft_cache_config is not None and draft_cache_config.cache_dtype not in (
-        "auto",
-        "fp8",
-        "fp8_e4m3",
-        "fp8_e5m2",
+    if (
+        not draft_is_mla
+        and draft_cache_config is not None
+        and draft_cache_config.cache_dtype
+        not in (
+            "auto",
+            "fp8",
+            "fp8_e4m3",
+            "fp8_e5m2",
+        )
     ):
         draft_cache_config = replace(draft_cache_config, cache_dtype="auto")
     draft_vllm_config = replace(
@@ -83,7 +93,10 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    target_inner = target_language_model.model
+    # Most VLM/causal-LM wrappers nest the backbone under ``.model``; the
+    # DeepSeek-V4.1 target exposes its backbone (DeepseekV41Model) directly via
+    # get_language_model(), so fall back to the language model itself.
+    target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = draft_model.model
 
     # Under pipeline parallelism the target's embed_tokens lives only on the

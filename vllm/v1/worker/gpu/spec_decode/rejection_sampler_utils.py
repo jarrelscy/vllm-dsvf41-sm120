@@ -1122,4 +1122,36 @@ def rejection_sample(
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
     )
+
+    import os as _os
+    if _os.environ.get("DSPARK_DBG") == "1":
+        _step = getattr(rejection_sample, "_dbg_step", 0)
+        if _step < 8:
+            rejection_sample._dbg_step = _step + 1
+            # Recompute the per-position target argmax straight from the target
+            # logits (independent of the kernels) so we can attribute divergence.
+            _tam = target_logits.argmax(dim=-1).to(torch.int64).tolist()
+            _cu = cu_num_logits.tolist()
+            _ds = draft_sampled.to(torch.int64).tolist()
+            _pos = pos.to(torch.int64).tolist()
+            _idxm = idx_mapping.to(torch.int64).tolist()
+            _ns = num_sampled.tolist()
+            _samp = sampled.tolist()
+            for _r in range(num_reqs):
+                _s = _cu[_r]
+                _e = _cu[_r + 1]
+                _ndraft = _e - _s - 1
+                # draft tokens compared at positions 0..ndraft-1 = draft_sampled[s+1:e]
+                _draft_block = _ds[_s + 1 : _e]
+                # target argmax at each verify position s..e-1 (last = bonus pos)
+                _targ_argmax = _tam[_s:_e]
+                _emit = _samp[_r][: _ns[_r]]
+                print(
+                    f"[DBGREJ] step={_step} req_slot={_idxm[_r]} "
+                    f"ndraft={_ndraft} pos={_pos[_s:_e]} "
+                    f"draft_block={_draft_block} "
+                    f"target_argmax_per_pos={_targ_argmax} "
+                    f"num_sampled={_ns[_r]} emitted={_emit}",
+                    flush=True,
+                )
     return sampled, num_sampled

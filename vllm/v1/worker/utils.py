@@ -325,6 +325,15 @@ def select_common_block_size(
             continue
         if block_size_is_supported(backends, supported_size):
             return supported_size
+    import os as _os
+    if _os.environ.get("V41_KVDBG"):
+        _dbg = [
+            (getattr(b, "get_name", lambda: b.__name__)(),
+             b.get_supported_kernel_block_sizes())
+            for b in backends
+        ]
+        print(f"[V41_KVDBG] select_common_block_size FAILED manager="
+              f"{kv_manager_block_size} backends={_dbg}", flush=True)
     raise ValueError(f"No common block size for {kv_manager_block_size}. ")
 
 
