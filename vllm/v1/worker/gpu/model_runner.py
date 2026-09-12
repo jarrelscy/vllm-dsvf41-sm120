@@ -244,6 +244,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # [max_num_tokens, engram_window_size]; allocated in load_model when
         # the model requests it (see _setup_engram_token_windows).
         self.engram_token_windows: torch.Tensor | None = None
+        # Cudagraph engram path (VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1):
+        # persistent gathered-rows (+ vision token-mask) buffers prefilled in
+        # prepare_inputs so the captured forward is pure tensor ops.
+        self.engram_gathered_rows: torch.Tensor | None = None
+        self.engram_token_mask: torch.Tensor | None = None
         if self.use_pp:
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
@@ -1170,6 +1175,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         model.set_engram_token_windows(self.engram_token_windows)
 
+        # Cudagraph engram path (VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1): allocate
+        # the persistent gathered-rows buffer the model consumes inside the
+        # captured region. Allocated HERE (before profiling / capture) and
+        # registered once, so every capture bakes in this stable address;
+        # prepare_inputs refreshes the contents each step
+        # (model.precompute_engram_rows). Zero-init: all-zero rows are a no-op
+        # write on the residual stream, so pre-first-step dummy/profile runs
+        # and cudagraph padding rows are safe.
+        spec = getattr(model, "engram_precompute_spec", None)
+        if spec is not None:
+            n_engram_layers, row_dim, needs_mask = spec
+            self.engram_gathered_rows = torch.zeros(
+                n_engram_layers,
+                self.max_num_tokens,
+                row_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            if needs_mask:
+                self.engram_token_mask = torch.zeros(
+                    self.max_num_tokens, dtype=torch.bool, device=self.device
+                )
+            model.set_engram_gathered_rows(
+                self.engram_gathered_rows, self.engram_token_mask
+            )
+
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
     ) -> InputBatch:
@@ -1331,6 +1362,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens,
                 num_reqs,
             )
+            if self.engram_gathered_rows is not None:
+                # Cudagraph engram path: run the host-dependent half (hash +
+                # CPU mmap row gather + dequant + TP all-reduce) NOW, outside
+                # the captured region, into the persistent rows buffer. Keys
+                # off the exact windows gathered above, so chunked prefill,
+                # prefix-cache hits and spec-decode rollback match the eager
+                # path; rows for cudagraph padding slots
+                # [num_tokens:num_tokens_after_padding] are zeroed (no-op on
+                # the stream inside the graph).
+                self.model.precompute_engram_rows(
+                    self.input_buffers.positions,
+                    num_tokens,
+                    num_tokens_after_padding,
+                )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]

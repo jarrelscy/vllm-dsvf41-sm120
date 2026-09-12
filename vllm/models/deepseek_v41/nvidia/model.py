@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -73,7 +73,9 @@ from vllm.models.deepseek_v41.engram import (
     Engram,
     EngramLayout,
     EngramServingHasher,
+    dsv41_engram_cudagraph_enabled,
     dsv41_engram_runtime_enabled,
+    precompute_engram_gathered_rows,
 )
 from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
     DeepseekV41FlashInferMLAAttention,
@@ -1194,28 +1196,66 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         # per-token windows).
         self.engram_hasher: EngramServingHasher | None = None
         self._engram_token_windows: torch.Tensor | None = None
+        # Cudagraph-compatible engram (VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1):
+        # persistent buffers the runner prefills with the gathered bf16 rows
+        # (+ vision token mask) before the captured region.
+        self.engram_precompute = False
+        self._engram_gathered_rows: torch.Tensor | None = None
+        self._engram_token_mask: torch.Tensor | None = None
         if self.engram_layout is not None and any(
             getattr(layer, "engram", None) is not None
             for layer in self.layers
             if not isinstance(layer, PPMissingLayer)
         ):
             # The engram row gather is a host-side op (CPU tables + H2D of the
-            # gathered rows): it cannot run inside a captured CUDA graph. Fail
-            # loudly at boot instead of failing capture (or silently corrupting
-            # output with VLLM_DSV41_LOAD_ENGRAM=0). Speed work (host-fn gather
-            # inside graphs, as sglang does) comes after the correctness gate.
-            if (
-                not vllm_config.model_config.enforce_eager
-                and os.environ.get("VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH", "0") != "1"
-            ):
+            # gathered rows): it cannot run inside a captured CUDA graph.
+            # VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1 hoists that host work into
+            # the V2 runner's prepare_inputs (BEFORE the captured region, see
+            # precompute_engram_gathered_rows) and the forward consumes a
+            # persistent prefilled buffer -- pure tensor ops, capturable under
+            # PIECEWISE graphs. With the flag off (default), fail loudly at
+            # boot instead of failing capture (or silently corrupting output
+            # with VLLM_DSV41_LOAD_ENGRAM=0).
+            self.engram_precompute = dsv41_engram_cudagraph_enabled(config)
+            if self.engram_precompute:
+                if not vllm_config.use_v2_model_runner:
+                    raise ValueError(
+                        "VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1 requires the V2 "
+                        "GPU model runner: only the V2 runner precomputes the "
+                        "engram table rows in prepare_inputs (the V1 runner's "
+                        "CPU window gather has no precompute hook). Use the V2 "
+                        "runner (VLLM_USE_V2_MODEL_RUNNER=1 / a spec-decode "
+                        "config that forces it), or unset the flag to fall "
+                        "back to --enforce-eager serving."
+                    )
+                cg_mode = vllm_config.compilation_config.cudagraph_mode
+                if (
+                    not vllm_config.model_config.enforce_eager
+                    and cg_mode is not None
+                    and cg_mode.has_mode(CUDAGraphMode.FULL)
+                ):
+                    raise ValueError(
+                        "VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1 supports "
+                        "PIECEWISE cudagraphs only (got cudagraph_mode="
+                        f"{cg_mode}): the engram consumer is capturable, but "
+                        "FULL capture is not validated for this model (the "
+                        "sparse indexer's python-metadata path is not FULL-"
+                        "capturable either). Set "
+                        "--compilation-config '{\"cudagraph_mode\": "
+                        "\"PIECEWISE\"}'."
+                    )
+            elif not vllm_config.model_config.enforce_eager:
                 raise ValueError(
                     "DeepSeek-V4.1-Flash engram is enabled (VLLM_DSV41_LOAD_"
                     "ENGRAM=1, the default) but the engine is not running in "
                     "eager mode. The engram's CPU-resident table gather cannot "
-                    "be captured in a CUDA graph yet: pass --enforce-eager "
-                    "(serve_v41.sh: DSV41_EAGER=1), or set "
-                    "VLLM_DSV41_LOAD_ENGRAM=0 to serve WITHOUT the engram "
-                    "(known token-level copy corruption)."
+                    "run inside a captured CUDA graph: pass --enforce-eager "
+                    "(serve_v41.sh: DSV41_EAGER=1), set "
+                    "VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1 (V2 runner, "
+                    "PIECEWISE graphs: the runner precomputes the rows before "
+                    "the captured region), or set VLLM_DSV41_LOAD_ENGRAM=0 to "
+                    "serve WITHOUT the engram (known token-level copy "
+                    "corruption)."
                 )
             # Engram hashes recompute per-request trailing windows every step.
             # The V2 model runner (forced for DSpark/MTP spec, i.e. the
@@ -1293,6 +1333,52 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def set_engram_gathered_rows(
+        self, rows: torch.Tensor, token_mask: torch.Tensor | None
+    ) -> None:
+        """Register the runner's persistent gathered-rows buffer
+        ([n_engram_layers, max_num_tokens, n_hash_cols * head_dim] bf16, plus
+        the [max_num_tokens] bool token mask for vision checkpoints). Stable
+        address: cudagraph replay reads the contents the runner prefilled."""
+        self._engram_gathered_rows = rows
+        self._engram_token_mask = token_mask
+
+    def _local_engram_modules(self) -> list[Engram]:
+        mods = self.__dict__.get("_engram_modules_cache")
+        if mods is None:
+            mods = [
+                layer.engram
+                for layer in islice(self.layers, self.start_layer, self.end_layer)
+                if getattr(layer, "engram", None) is not None
+            ]
+            self.__dict__["_engram_modules_cache"] = mods
+        return mods
+
+    def precompute_engram_rows(
+        self, positions: torch.Tensor, num_tokens: int, num_tokens_padded: int
+    ) -> None:
+        """Cudagraph engram path, host half: called by the V2 runner from
+        prepare_inputs (AFTER gather_token_windows_gpu, BEFORE the captured
+        region) to hash this step's windows and gather + dequantize the table
+        rows into the persistent buffer registered above."""
+        assert self.engram_hasher is not None
+        windows = self._engram_token_windows
+        rows_buf = self._engram_gathered_rows
+        assert windows is not None and rows_buf is not None, (
+            "precompute_engram_rows called before the runner registered the "
+            "engram window / gathered-rows buffers"
+        )
+        precompute_engram_gathered_rows(
+            self.engram_hasher,
+            self._local_engram_modules(),
+            windows,
+            positions,
+            num_tokens,
+            num_tokens_padded,
+            rows_buf,
+            self._engram_token_mask,
+        )
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -1339,23 +1425,57 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         # support enabled the runner hands the model inputs_embeds and
         # input_ids may be None; the windows also carry the predecessors of
         # chunk-leading tokens that a prefix-cache hit skipped).
-        engram_hash_ids = engram_token_mask = None
+        engram_hash_ids = engram_token_mask = engram_rows = None
         if self.engram_hasher is not None:
             num_tokens = positions.shape[0]
-            windows = self._engram_token_windows
-            if windows is None or windows.shape[0] < num_tokens:
-                # Profiling / dummy runs before the runner registered its
-                # window buffer: hash all-zero windows (valid table rows, so
-                # memory/comms are exercised; the outputs are discarded).
-                windows = torch.zeros(
-                    num_tokens,
-                    self.engram_hasher.layout.max_ngram_size,
-                    dtype=torch.int32,
-                    device=positions.device,
+            if self.engram_precompute:
+                # Cudagraph path: the runner already hashed + gathered this
+                # step's rows into the persistent buffer (prepare_inputs,
+                # BEFORE the captured region). Consuming it is pure tensor
+                # ops on a stable address. A missing/undersized buffer must
+                # fail LOUDLY: falling back to a temporary tensor here would
+                # bake the temporary's address into the captured graph and
+                # silently replay stale engram rows forever after.
+                rows_buf = self._engram_gathered_rows
+                if rows_buf is None or rows_buf.shape[1] < num_tokens:
+                    raise RuntimeError(
+                        "VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1: the engram "
+                        "gathered-rows buffer was not registered (or is too "
+                        "small: "
+                        f"{None if rows_buf is None else tuple(rows_buf.shape)}"
+                        f" vs {num_tokens} tokens) before a forward pass. The "
+                        "V2 runner must allocate it in load_model (see "
+                        "_setup_engram_token_windows) and prefill it in "
+                        "prepare_inputs every step."
+                    )
+                # [n_engram_layers, T, n_hash_cols*head_dim]; slot-major, so
+                # each layer's [T, D] slice below stays contiguous.
+                engram_rows = rows_buf[:, :num_tokens]
+                if self.engram_hasher.image_token_id is not None:
+                    mask_buf = self._engram_token_mask
+                    if mask_buf is None or mask_buf.shape[0] < num_tokens:
+                        raise RuntimeError(
+                            "VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1: the engram "
+                            "token-mask buffer was not registered before a "
+                            "forward pass (vision checkpoint: the gate must "
+                            "close on image-span tokens)."
+                        )
+                    engram_token_mask = mask_buf[:num_tokens]
+            else:
+                windows = self._engram_token_windows
+                if windows is None or windows.shape[0] < num_tokens:
+                    # Profiling / dummy runs before the runner registered its
+                    # window buffer: hash all-zero windows (valid table rows,
+                    # so memory/comms are exercised; outputs are discarded).
+                    windows = torch.zeros(
+                        num_tokens,
+                        self.engram_hasher.layout.max_ngram_size,
+                        dtype=torch.int32,
+                        device=positions.device,
+                    )
+                engram_hash_ids, engram_token_mask = self.engram_hasher(
+                    windows[:num_tokens], positions
                 )
-            engram_hash_ids, engram_token_mask = self.engram_hasher(
-                windows[:num_tokens], positions
-            )
 
         residual, post_mix, res_mix, pre_mix = None, None, None, None
         aux_hidden_states: list[torch.Tensor] = []
@@ -1363,7 +1483,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            if layer.engram is not None and engram_hash_ids is not None:
+            if layer.engram is not None and (
+                engram_hash_ids is not None or engram_rows is not None
+            ):
                 # Reference insertion point (inference/model.py:1288): the
                 # engram is applied to the multi-stream HC state h entering
                 # layer i, BEFORE the layer. The port DEFERS each sublayer's
@@ -1390,11 +1512,21 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     engram_h = mhc_post_torch(
                         hidden_states, residual, post_mix, res_mix
                     )
-                engram_h = layer.engram(
-                    engram_h,
-                    engram_hash_ids[:, layer.engram.layer_hash_index],
-                    engram_token_mask,
-                )
+                if engram_rows is not None:
+                    # Cudagraph path: consume the runner-prefilled rows.
+                    # Same consumer code as the in-forward path (forward is
+                    # forward_gathered over embed()) -- bit-identical.
+                    engram_h = layer.engram.forward_gathered(
+                        engram_h,
+                        engram_rows[layer.engram.layer_hash_index],
+                        engram_token_mask,
+                    )
+                else:
+                    engram_h = layer.engram(
+                        engram_h,
+                        engram_hash_ids[:, layer.engram.layer_hash_index],
+                        engram_token_mask,
+                    )
                 if idx in self.aux_hidden_state_layers and aux_hidden_states:
                     # The DSpark aux capture for THIS layer ran at the end of
                     # the previous iteration, i.e. pre-engram. The reference
@@ -1952,6 +2084,40 @@ class DeepseekV41ForCausalLM(
         of per-token n-gram windows (stable address; refreshed every step,
         sliced to the batch inside forward)."""
         self.model._engram_token_windows = windows_gpu
+
+    @property
+    def engram_precompute_spec(self) -> tuple[int, int, bool] | None:
+        """Non-None when the cudagraph engram path is on
+        (VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1): (n_engram_layers,
+        n_hash_cols * head_dim, needs_token_mask). The V2 runner allocates a
+        persistent [n_engram_layers, max_num_tokens, n_hash_cols * head_dim]
+        bf16 rows buffer (+ [max_num_tokens] bool mask when needed), registers
+        it via set_engram_gathered_rows, and prefills it every step via
+        precompute_engram_rows."""
+        hasher = getattr(self.model, "engram_hasher", None)
+        if hasher is None or not getattr(self.model, "engram_precompute", False):
+            return None
+        layout = hasher.layout
+        n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+        return (
+            len(layout.layer_ids),
+            n_hash_cols * layout.head_dim,
+            hasher.image_token_id is not None,
+        )
+
+    def set_engram_gathered_rows(
+        self, rows: torch.Tensor, token_mask: torch.Tensor | None
+    ) -> None:
+        """Register the runner's persistent gathered-rows (+ token mask)
+        buffers for the cudagraph engram path (see engram_precompute_spec)."""
+        self.model.set_engram_gathered_rows(rows, token_mask)
+
+    def precompute_engram_rows(
+        self, positions: torch.Tensor, num_tokens: int, num_tokens_padded: int
+    ) -> None:
+        """Hash + gather this step's engram rows into the persistent buffer
+        (host-dependent half, run by the runner before the captured region)."""
+        self.model.precompute_engram_rows(positions, num_tokens, num_tokens_padded)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ``mtp.`` is skipped whenever speculative decoding is off (no draft

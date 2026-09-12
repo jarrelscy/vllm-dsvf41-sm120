@@ -441,5 +441,120 @@ check("V2 gather ignores stale rejected drafts",
       torch.equal(windows[10, 1], drafts[0])
       and torch.equal(windows[13, 3], drafts[1]))
 
+# ---------------------------------------------------------------------------
+# 6. cudagraph engram path (VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1): the runner
+#    precompute (hash + gather into a persistent buffer, outside the captured
+#    region) + in-graph consumption (forward_gathered) must be bit-identical
+#    to the flag-OFF in-forward path, including padded slots and chunking.
+# ---------------------------------------------------------------------------
+print("\n[6] cudagraph precompute path vs in-forward path")
+from vllm.models.deepseek_v41.engram import (  # noqa: E402
+    precompute_engram_gathered_rows,
+)
+
+torch.manual_seed(4)
+N_LAYERS = len(layout.layer_ids)
+ROW_DIM = n_hash_cols * head_dim
+MAXT = 128
+
+# second engram (layer 14 -> slot 1) with its own synthetic table + wkv, so
+# slot addressing in the [n_layers, T, D] buffer is actually exercised
+wkv_weight14 = (torch.randn(dim * (hc + 1), ROW_DIM) / 64).to(torch.bfloat16)
+port_eng14 = Engram(small_cfg, 14, small_layout, PlainWkv(wkv_weight14),
+                    table_device="cpu", table_source="ram")
+w14 = torch.randint(0, 255, (SMALL_ROWS, head_dim), dtype=torch.uint8)
+w14[w14 == 0x7F] = 0
+w14[w14 == 0xFF] = 0
+s14 = torch.randint(118, 132, (SMALL_ROWS, head_dim // 32), dtype=torch.uint8)
+port_eng14.embed.weight.data.copy_(w14.view(torch.float8_e4m3fn))
+port_eng14.embed.scale.data.copy_(s14.view(torch.float8_e8m0fnu))
+engrams = [port_eng, port_eng14]
+check("engram slot indices", port_eng.layer_hash_index == 0
+      and port_eng14.layer_hash_index == 1)
+
+
+class StubHasher:
+    """Position-keyed hash stub: a pure function of the token position, like
+    the real hasher is of the window. Lets the equivalence test use IN-RANGE
+    ids on the synthetic 4096-row table (the real hasher's ids land almost
+    entirely outside it, which would make the row contents trivially zero)."""
+
+    def __init__(self, ids, mask=None):
+        self.ids, self.mask = ids, mask
+
+    def __call__(self, windows, positions):
+        p = positions.to(torch.int64)
+        return self.ids[p], None if self.mask is None else self.mask[p]
+
+
+# (a) one-shot + cudagraph padding slots (buffer pre-filled with garbage to
+# prove precompute zeroes the pad region, not just inherits zero-init)
+T6, TPAD = 9, 16
+ids6 = torch.randint(0, SMALL_ROWS, (MAXT, N_LAYERS, n_hash_cols))
+mask6_full = torch.ones(MAXT, dtype=torch.bool)
+mask6_full[3] = False  # an "image" position
+stub = StubHasher(ids6, mask6_full)
+x_pad = torch.randn(TPAD, hc, dim, dtype=torch.bfloat16)
+
+rows_buf = torch.ones(N_LAYERS, MAXT, ROW_DIM, dtype=torch.bfloat16)
+mask_buf = torch.zeros(MAXT, dtype=torch.bool)
+win_buf = torch.zeros(MAXT, N, dtype=torch.int32)  # stub ignores contents
+pos_buf = torch.arange(MAXT)
+precompute_engram_gathered_rows(
+    stub, engrams, win_buf, pos_buf, T6, TPAD, rows_buf, mask_buf)
+
+ok = True
+for eng in engrams:
+    s = eng.layer_hash_index
+    out_eager = eng(x_pad[:T6], ids6[:T6, s], mask6_full[:T6])
+    # matched token count: the flag-ON path differs ONLY in where the gather
+    # ran (runner buffer vs in-forward), so this must be bit-exact
+    out_pre = eng.forward_gathered(
+        x_pad[:T6], rows_buf[s, :T6], mask_buf[:T6])
+    ok &= torch.equal(out_pre, out_eager)
+check("flag-ON == flag-OFF (real tokens, both slots)", ok)
+check("gathered rows == eager embed",
+      torch.equal(rows_buf[0, :T6],
+                  port_eng.embed(ids6[:T6, 0]).flatten(-2)))
+check("padded rows zeroed over stale garbage",
+      bool((rows_buf[:, T6:TPAD] == 0).all())
+      and bool((rows_buf[:, TPAD:] == 1).all()))
+check("padded mask False", bool((~mask_buf[T6:TPAD]).all())
+      and torch.equal(mask_buf[:T6], mask6_full[:T6]))
+out_pre = port_eng.forward_gathered(x_pad, rows_buf[0, :TPAD], mask_buf[:TPAD])
+check("padded slots are a residual no-op",
+      torch.equal(out_pre[T6:], x_pad[T6:])
+      and bool(out_pre.isfinite().all()))
+
+# (b) chunked / multi-step: two prepare_inputs steps reuse the same persistent
+# buffer; concatenated outputs must equal the one-shot flag-OFF forward
+L6, CUT = 32, 13
+x6 = torch.randn(L6, hc, dim, dtype=torch.bfloat16)
+outs = []
+for lo, hi in ((0, CUT), (CUT, L6)):
+    t = hi - lo
+    pos_buf6 = torch.arange(lo, hi)  # runner: this step's positions at [0:t]
+    precompute_engram_gathered_rows(
+        stub, engrams, win_buf, pos_buf6, t, t, rows_buf, mask_buf)
+    outs.append(port_eng14.forward_gathered(
+        x6[lo:hi], rows_buf[1, :t], mask_buf[:t]))
+out_oneshot = port_eng14(x6, ids6[:L6, 1], mask6_full[:L6])
+check("chunked multi-step == one-shot", torch.equal(torch.cat(outs), out_oneshot))
+
+# (c) end-to-end with the REAL hasher (real windows from section 1, image span):
+# same windows -> same hash ids -> same rows and token mask on both paths
+x96 = torch.randn(L, hc, dim, dtype=torch.bfloat16)
+win_buf96 = torch.zeros(MAXT, N, dtype=torch.int32)
+win_buf96[:L] = win3
+pos96 = torch.arange(L)  # NB: section 5 rebound `pos` to its 14-token batch
+rows_buf.fill_(1)
+precompute_engram_gathered_rows(
+    hasher, [port_eng], win_buf96, torch.arange(MAXT), L, L, rows_buf, mask_buf)
+hash96, mask96 = hasher(win3, pos96)
+out_eager96 = port_eng(x96, hash96[:, 0], mask96)
+out_pre96 = port_eng.forward_gathered(x96, rows_buf[0, :L], mask_buf[:L])
+check("real-hasher flag-ON == flag-OFF", torch.equal(out_pre96, out_eager96))
+check("real-hasher token mask via buffer", torch.equal(mask_buf[:L], mask96))
+
 print("\nRESULT:", "ALL PASS" if not failures else f"FAILURES: {failures}")
 sys.exit(0 if not failures else 1)

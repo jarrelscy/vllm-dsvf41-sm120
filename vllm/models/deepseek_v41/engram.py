@@ -24,6 +24,15 @@ token history, so the serving runner supplies per-request token windows; the has
 below is unchanged. Because the CPU gather + H2D copy is a host sync, the engram runs in the
 eager / piecewise region, never inside a captured FULL cudagraph (same discipline as the v4
 indexer's python-metadata path).
+
+Cudagraph mode (``VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1``, V2 runner only): ALL host-dependent
+work (hash + CPU mmap row gather + dequant + TP all-reduce) is hoisted out of the model
+forward into the runner's ``prepare_inputs`` (see :func:`precompute_engram_gathered_rows`),
+which writes the gathered bf16 rows into a persistent GPU buffer. The captured forward then
+consumes the prefilled buffer via :meth:`Engram.forward_gathered` -- pure tensor ops (fp8 wkv
+projection + gate), all capturable under PIECEWISE graphs. The math is IDENTICAL to the
+in-forward path: ``Engram.forward`` is literally ``forward_gathered(x, embed(ids).flatten(-2))``,
+and the precompute calls the very same ``hasher``/``embed`` modules on the very same windows.
 """
 
 import json
@@ -53,6 +62,17 @@ def dsv41_engram_runtime_enabled(config) -> bool:
     garbage; loaded tensors without a module would crash the loader)."""
     return bool(getattr(config, "engram_layer_ids", None)) and (
         os.environ.get("VLLM_DSV41_LOAD_ENGRAM", "1") == "1"
+    )
+
+
+def dsv41_engram_cudagraph_enabled(config) -> bool:
+    """Whether the cudagraph-compatible engram path is on: the engram itself is
+    on AND ``VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1`` (default OFF). When enabled,
+    the runner precomputes the gathered table rows into a persistent GPU buffer
+    before the captured region (V2 model runner only) and the forward consumes
+    the buffer with pure tensor ops, so eager is no longer forced."""
+    return dsv41_engram_runtime_enabled(config) and (
+        os.environ.get("VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH", "0") == "1"
     )
 
 
@@ -596,14 +616,82 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(ra["hc_mult"], ra["dim"]), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(ra["hc_mult"], ra["dim"]), requires_grad=False)
 
-    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor,
-                token_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """x: [B, L, hc_mult, dim] or [T, hc_mult, dim]; hash_ids: [.., n_hash_cols];
-        token_mask: [B, L] / [T] (True = text token whose gate may open)."""
-        kv = self.wkv(self.embed(hash_ids).flatten(-2))
+    def forward_gathered(self, x: torch.Tensor, gathered_rows: torch.Tensor,
+                         token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Consume ALREADY-GATHERED (dequantized bf16, TP all-reduced) table
+        rows: pure tensor ops from here (fp8 wkv GEMM + fp32 gate), so this half
+        is safe inside a captured CUDA graph. ``gathered_rows``:
+        [.., n_hash_cols * head_dim], i.e. ``embed(hash_ids).flatten(-2)``.
+        All-zero rows (cudagraph padding slots / unregistered windows) are a
+        no-op on the stream: wkv(0) = 0 so value = 0 and the gated write adds
+        nothing (the gate itself is finite: sigmoid of +-sqrt(clamp))."""
+        kv = self.wkv(gathered_rows)
         if isinstance(kv, tuple):  # vLLM Linear layers return (out, bias)
             kv = kv[0]
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         return engram_gate(x, key, value, self.q_weight, self.k_weight,
                            self.dim, self.eps, self.clamp_value, token_mask)
+
+    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor,
+                token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """x: [B, L, hc_mult, dim] or [T, hc_mult, dim]; hash_ids: [.., n_hash_cols];
+        token_mask: [B, L] / [T] (True = text token whose gate may open)."""
+        return self.forward_gathered(
+            x, self.embed(hash_ids).flatten(-2), token_mask)
+
+
+@torch.inference_mode()
+def precompute_engram_gathered_rows(
+    hasher: EngramServingHasher,
+    engrams: list[Engram],
+    windows: torch.Tensor,
+    positions: torch.Tensor,
+    num_tokens: int,
+    num_tokens_padded: int,
+    rows_buf: torch.Tensor,
+    mask_buf: torch.Tensor | None,
+) -> None:
+    """The HOST-DEPENDENT half of the engram, run by the model runner in
+    prepare_inputs, BEFORE the captured region (VLLM_DSV41_ENGRAM_ALLOW_
+    CUDAGRAPH=1). Hashes this step's per-token windows and gathers +
+    dequantizes the table rows into the persistent ``rows_buf``, so the
+    captured forward only reads the (stable-address) buffer.
+
+    Bit-losslessness: this calls the EXACT modules the in-forward path calls
+    (``hasher`` -> :class:`EngramServingHasher`, ``eng.embed`` ->
+    :class:`ParallelEngramEmbedding` incl. its CPU fp32 dequant, single bf16
+    round and TP all-reduce, in the same order on the same [num_tokens, ..]
+    shapes), then copies bf16 -> bf16 (exact). The consumer
+    (:meth:`Engram.forward_gathered`) is the same code the in-forward path
+    runs after its own gather.
+
+    * ``windows``: the persistent [max_num_tokens, max_ngram_size] window
+      buffer already filled by :func:`gather_token_windows_gpu` for THIS
+      step's token set -- chunked prefill, prefix-cache hits and spec-decode
+      rollback are therefore keyed identically to the eager path.
+    * ``engrams``: this PP rank's local Engram modules; each fills its own
+      ``layer_hash_index`` slot (each TP rank gathers its own row shard,
+      the all-reduce inside ``embed`` completes the rows, exactly as today).
+    * ``rows_buf``: persistent [n_engram_layers, max_num_tokens,
+      n_hash_cols * head_dim] bf16 GPU buffer (slot-major so each layer's
+      [T, D] slice stays contiguous for the fp8 wkv GEMM).
+    * padding: rows (and mask) for cudagraph padding slots
+      [num_tokens:num_tokens_padded] are zeroed (/False) -- deterministic,
+      and a no-op on the stream in ``forward_gathered``.
+    """
+    hash_ids, token_mask = hasher(windows[:num_tokens], positions[:num_tokens])
+    pad_end = min(int(num_tokens_padded), rows_buf.shape[1])
+    for eng in engrams:
+        slot = eng.layer_hash_index
+        rows_buf[slot, :num_tokens] = eng.embed(
+            hash_ids[:, slot]).flatten(-2)
+        if pad_end > num_tokens:
+            rows_buf[slot, num_tokens:pad_end].zero_()
+    if mask_buf is not None:
+        if token_mask is not None:
+            mask_buf[:num_tokens] = token_mask
+        else:
+            mask_buf[:num_tokens] = True
+        if pad_end > num_tokens:
+            mask_buf[num_tokens:pad_end] = False
