@@ -22,6 +22,8 @@ logger = init_logger(__name__)
 _VLLM_RENDERERS = {
     "deepseek_v32": ("deepseek_v32", "DeepseekV32Renderer"),
     "deepseek_v4": ("deepseek_v4", "DeepseekV4Renderer"),
+    # V4.1 reuses the V4 renderer; the dialect lives in the tokenizer wrapper.
+    "deepseek_v41": ("deepseek_v4", "DeepseekV4Renderer"),
     "hf": ("hf", "HfRenderer"),
     "kimi_audio": ("hf", "HfRenderer"),
     "mistral": ("mistral", "MistralRenderer"),
