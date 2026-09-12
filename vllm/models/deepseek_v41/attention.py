@@ -47,8 +47,12 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.models.deepseek_v41.candidates import (
+    CANDIDATE_ROLE_CONSUMER,
+    CANDIDATE_ROLE_NONE,
+    CANDIDATE_ROLE_SOURCE,
+)
 from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
-from vllm.models.deepseek_v41.candidates import select_candidate_blocks
 from vllm.models.deepseek_v41.compressor import (
     DeepseekCompressor,
     DeepseekV41RefCompressor,
@@ -620,8 +624,8 @@ class DeepseekV41Attention(nn.Module, AttentionLayerBase, ABC):
             # Produces this index_source layer's topk_idxs (level-2 top-k). On the
             # candidate source (layer 20) it also publishes the candidate mask;
             # uses_candidates layers (24/28/32/36) apply masked_fill(~candidates)
-            # before their top-k. Both are wired structurally on the indexer; the
-            # numeric candidate masking is a GPU-gated seam (see indexer.forward).
+            # before their top-k. Both happen numerically inside the indexer op
+            # (see SparseAttnIndexer candidate_role / candidates.py).
             self.indexer(
                 hidden_states,
                 qr,
@@ -981,6 +985,41 @@ class DeepseekV41Indexer(nn.Module):
             )
             self._source_k_cache = src
 
+        # Two-level candidates: the source (layer 20) publishes the level-1
+        # block mask from its logits inside the op; consumers (24/28/32/36)
+        # masked_fill(-inf) their logits with it before their level-2 top-k.
+        # The runtime store keys on the shared indexer metadata object; that
+        # sharing (and the block-coordinate alignment) holds exactly because
+        # consumers read the SOURCE's k_cache (same metadata prefix), which the
+        # released config guarantees: candidate consumers' nearest kv_source is
+        # layer 20 itself. All five layers are compress-ratio 1, so the op's
+        # compressed seq_lens equal the reference's token-position lens.
+        if self.is_candidate_source:
+            candidate_role = CANDIDATE_ROLE_SOURCE
+        elif self.uses_candidates:
+            candidate_role = CANDIDATE_ROLE_CONSUMER
+        else:
+            candidate_role = CANDIDATE_ROLE_NONE
+        if candidate_role != CANDIDATE_ROLE_NONE:
+            assert self.compress_ratio == 1, (
+                "DSV41 candidate wiring assumes compress-ratio-1 layers "
+                f"(got ratio {self.compress_ratio} at {prefix})"
+            )
+        if candidate_role == CANDIDATE_ROLE_CONSUMER:
+            # The runtime mask store keys on the indexer metadata object, which
+            # is shared iff this consumer reads the candidate source's own
+            # index-k cache (same k_cache prefix -> same metadata entry).
+            assert (
+                self.candidate_source_prefix is not None
+                and index_k_source_prefix
+                == f"{self.candidate_source_prefix}.indexer.k_cache"
+            ), (
+                f"candidate consumer {prefix} reads index_k from "
+                f"{index_k_source_prefix}, not from the candidate source "
+                f"{self.candidate_source_prefix}: the shared-metadata "
+                "assumption of the candidate mask store does not hold"
+            )
+
         # The SparseAttnIndexer wraps whichever index-k cache this layer reads:
         # its own (owns_k) or the shared source cache (non-owner). skip_k_cache_
         # insert=True because v41 writes index-k via the owns_k derive path above,
@@ -1000,6 +1039,9 @@ class DeepseekV41Indexer(nn.Module):
             # source cache and must NOT insert.
             skip_k_cache_insert=not self.owns_k,
             use_fp4_cache=self.use_fp4_kv,
+            candidate_role=candidate_role,
+            candidate_topk_blocks=self.candidate_topk_blocks,
+            candidate_block_size=self.candidate_block_size,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -1097,13 +1139,12 @@ class DeepseekV41Indexer(nn.Module):
             q_quant, weights = wq_b_and_q_quant()
             k = None
 
-        # TODO(gpu-gate): two-level candidates. The candidate mask
-        # (masked_fill(~candidates, -inf) before this op's level-2 top-k) and the
-        # candidate publish (select_candidate_blocks on the level-1 index_score at
-        # the candidate source) both need to happen around the index_score the
-        # SparseAttnIndexer computes internally. This requires either op-level
-        # candidate support or a torch index_score path here (reference
-        # Indexer.forward 571-596). Wired structurally via
-        # self.is_candidate_source / self.uses_candidates / candidate buffers;
-        # the numeric masking is the GPU-gated seam.
+        # Two-level candidates run INSIDE the op (sparse_attn_indexer), which is
+        # where the fp32 index_score/logits exist in both the prefill and decode
+        # paths: the source layer publishes the level-1 block mask
+        # (candidate_keep_blocks on its logits, reference select_candidate_blocks
+        # semantics incl. newest-block pin) and consumer layers
+        # masked_fill(~candidates, -inf) before their level-2 top-k. Wired via
+        # the candidate_role passed to SparseAttnIndexer above; kill switch
+        # VLLM_DSV41_CANDIDATES=0. See vllm/models/deepseek_v41/candidates.py.
         return self.indexer_op(hidden_states, q_quant, k, weights)
