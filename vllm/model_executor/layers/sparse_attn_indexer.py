@@ -331,6 +331,9 @@ def sparse_attn_indexer(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    candidate_role: int = 0,
+    candidate_topk_blocks: int = 0,
+    candidate_block_size: int = 0,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -385,6 +388,40 @@ def sparse_attn_indexer(
         return topk_indices_buffer
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
+
+    # --- DeepSeek-V4.1-Flash two-level candidate masking ------------------
+    # Layer 20 (source) publishes a per-request block-keep mask computed from
+    # its own logits; layers 24/28/32/36 (consumers) masked_fill(-inf) outside
+    # those blocks BEFORE their level-2 top-k. All five layers share this op
+    # call path AND this metadata object (their indexer k_cache resolves to
+    # layer 20's cache prefix), so chunking / row layout / seq_lens are
+    # identical between publish and consume. Lazy import: candidates.py lives
+    # in the deepseek_v41 model package (importing it at module scope would be
+    # circular through the model __init__), and role != 0 only ever happens
+    # after that package is fully imported.
+    _cand = None
+    if candidate_role != 0:
+        from vllm.models.deepseek_v41 import candidates as _cand_mod
+
+        if _cand_mod.candidates_enabled():
+            _cand = _cand_mod
+            if dcp_world_size > 1:
+                raise NotImplementedError(
+                    "DSV41 two-level candidates do not support DCP: the "
+                    "indexer logits (and thus candidate block coordinates) "
+                    "would be sharded per rank."
+                )
+            if candidate_role == _cand_mod.CANDIDATE_ROLE_SOURCE:
+                _cand_mod.CANDIDATE_STORE.begin(attn_metadata_narrowed)
+            elif not _cand_mod.CANDIDATE_STORE.matches(attn_metadata_narrowed):
+                # Fail loud: a consumer running without this step's published
+                # mask is exactly the silent long-context corruption this
+                # feature fixes.
+                raise RuntimeError(
+                    "DSV41 candidate consumer ran without a matching source "
+                    "publish this forward (VLLM_DSV41_CANDIDATES inconsistent "
+                    "across layers, or layer order violated)."
+                )
     slot_mapping = attn_metadata_narrowed.slot_mapping
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
@@ -439,7 +476,7 @@ def sparse_attn_indexer(
             values_spec,
             scales_spec,
         )
-        for chunk in prefill_metadata.chunks:
+        for chunk_idx, chunk in enumerate(prefill_metadata.chunks):
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
             assert chunk.local_cu_seq_lens is not None
@@ -467,6 +504,9 @@ def sparse_attn_indexer(
             if chunk.local_total_seq_lens == 0:
                 logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)
                 topk_indices.fill_(-1)
+                if _cand is not None and candidate_role == _cand.CANDIDATE_ROLE_SOURCE:
+                    # Keep chunk keys aligned for consumers.
+                    _cand.CANDIDATE_STORE.prefill[chunk_idx] = []
             else:
                 # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
                 # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.
@@ -498,6 +538,30 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         clean_logits=False,
                     )
+                if _cand is not None:
+                    # Level-1 publish / level-2 mask around the fp32 logits,
+                    # BEFORE the top-k kernel. Per-request block alignment and
+                    # per-query-token visible lens come from cu_seqlen_ks/ke.
+                    if candidate_role == _cand.CANDIDATE_ROLE_SOURCE:
+                        _cand.CANDIDATE_STORE.prefill[chunk_idx] = (
+                            _cand.build_prefill_chunk_candidates(
+                                logits,
+                                cu_seqlen_ks,
+                                cu_seqlen_ke,
+                                candidate_topk_blocks,
+                                candidate_block_size,
+                            )
+                        )
+                    else:
+                        groups = _cand.CANDIDATE_STORE.prefill.get(chunk_idx)
+                        if groups is None:
+                            raise RuntimeError(
+                                "DSV41 candidate consumer: no published mask "
+                                f"for prefill chunk {chunk_idx}."
+                            )
+                        _cand.apply_prefill_chunk_candidates(
+                            logits, groups, candidate_block_size
+                        )
                 num_rows = logits.shape[0]
                 ops.top_k_per_row_prefill(
                     logits,
@@ -607,6 +671,28 @@ def sparse_attn_indexer(
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
+        if _cand is not None:
+            # Rows are token-major (row = b * next_n + j); seq_lens flattens to
+            # exactly that order for plain decode, native spec-decode verify
+            # (2D (B, next_n)) and the flattened/padded paths. Padded rows get
+            # garbage lens -> all-false keep -> their top-k output is dropped
+            # by unpack_seq_triton just like today.
+            if candidate_role == _cand.CANDIDATE_ROLE_SOURCE:
+                _cand.CANDIDATE_STORE.decode = _cand.build_decode_candidates(
+                    logits,
+                    seq_lens.reshape(-1),
+                    attn_metadata_narrowed.max_seq_len,
+                    candidate_topk_blocks,
+                    candidate_block_size,
+                )
+            else:
+                keep = _cand.CANDIDATE_STORE.decode
+                if keep is None:
+                    raise RuntimeError(
+                        "DSV41 candidate consumer: no published decode mask."
+                    )
+                _cand.apply_decode_candidates(logits, keep, candidate_block_size)
+
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
@@ -706,6 +792,9 @@ def sparse_attn_indexer_fake(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    candidate_role: int = 0,
+    candidate_topk_blocks: int = 0,
+    candidate_block_size: int = 0,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -744,6 +833,9 @@ class SparseAttnIndexer(CustomOp):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        candidate_role: int = 0,
+        candidate_topk_blocks: int = 0,
+        candidate_block_size: int = 0,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -756,6 +848,14 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        # DSV41 two-level candidates: 0 = uninvolved, 1 = source (publishes the
+        # level-1 block mask), 2 = consumer (masks its logits with it). See
+        # vllm/models/deepseek_v41/candidates.py.
+        self.candidate_role = candidate_role
+        self.candidate_topk_blocks = candidate_topk_blocks
+        self.candidate_block_size = candidate_block_size
+        if candidate_role != 0:
+            assert candidate_topk_blocks > 0 and candidate_block_size > 0
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
@@ -819,6 +919,9 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            candidate_role=self.candidate_role,
+            candidate_topk_blocks=self.candidate_topk_blocks,
+            candidate_block_size=self.candidate_block_size,
         )
 
     def forward_xpu(
@@ -838,6 +941,10 @@ class SparseAttnIndexer(CustomOp):
         weights: torch.Tensor,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
+        assert self.candidate_role == 0, (
+            "DSV41 two-level candidates are not wired into the ROCm AITER "
+            "indexer op"
+        )
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
