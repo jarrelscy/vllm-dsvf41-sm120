@@ -1512,6 +1512,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # a row-shard / validate-only weight_loader) -- undo the rename.
             if ".engram.embed." in name and name.endswith(".weight_scale_inv"):
                 name = name[: -len(".weight_scale_inv")] + ".scale"
+            # Same collision for the ``embed.weight`` -> ``embed_tokens.weight``
+            # suffix rule (meant for the main token embedding): it renames the
+            # engram table rows too. The parameter is ``engram.embed.weight``.
+            if name.endswith(".engram.embed_tokens.weight"):
+                name = name[: -len(".embed_tokens.weight")] + ".embed.weight"
             # Hybrid per-expert tensors (nvfp4_aqlm_hybrid) are stored at the
             # checkpoint-stable path ffn.experts.*; the runtime parameters live
             # on the MoERunner's RoutedExperts submodule. Remap and load them
