@@ -40,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -68,6 +69,12 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v41.attention import DeepseekV41Attention
+from vllm.models.deepseek_v41.engram import (
+    Engram,
+    EngramLayout,
+    EngramServingHasher,
+    dsv41_engram_runtime_enabled,
+)
 from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
     DeepseekV41FlashInferMLAAttention,
     DeepseekV41FlashInferSM120Attention,
@@ -931,6 +938,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        engram_layout: EngramLayout | None = None,
     ):
         super().__init__()
 
@@ -946,6 +954,37 @@ class DeepseekV41DecoderLayer(nn.Module):
             aux_stream_list=aux_stream_list,
         )
         self.ffn = DeepseekV41MoE(vllm_config, prefix=f"{prefix}.ffn")
+
+        # Engram n-gram hash memory (layers ``engram_layer_ids`` = 1, 14). The
+        # two fp8 row tables (~98 GB each) stay HOST-resident (mmap of the
+        # checkpoint shard by default; VLLM_DSV41_ENGRAM_TABLE=ram copies each
+        # rank's row shard into anonymous host memory) -- only the gathered
+        # [T, 24, 256] rows cross PCIe. The small tensors (fp8 wkv projection,
+        # bf16 q/k gate weights) live on GPU: wkv is REPLICATED across TP ranks
+        # exactly like the reference/sglang (the TP split of the engram is the
+        # row-sharded table + all-reduce inside ParallelEngramEmbedding; the
+        # projection and gate then run identically on every rank).
+        self.engram = None
+        if engram_layout is not None and self.layer_idx in engram_layout.layer_ids:
+            n_hash_cols = (engram_layout.max_ngram_size - 1) * engram_layout.n_heads
+            wkv = ReplicatedLinear(
+                n_hash_cols * engram_layout.head_dim,
+                config.hidden_size * (config.hc_mult + 1),
+                bias=False,
+                quant_config=vllm_config.quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.engram.wkv",
+            )
+            self.engram = Engram(
+                config,
+                self.layer_idx,
+                engram_layout,
+                wkv,
+                table_device=os.environ.get("VLLM_DSV41_ENGRAM_DEVICE", "cpu"),
+                table_source=os.environ.get("VLLM_DSV41_ENGRAM_TABLE", "mmap"),
+                ckpt_dir=vllm_config.model_config.model,
+                ckpt_prefix=f"layers.{self.layer_idx}.engram",
+            )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1129,6 +1168,15 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Engram layout (None disables the engram everywhere: no modules are
+        # built AND the loader skips the checkpoint tensors -- the same
+        # dsv41_engram_runtime_enabled() gates both, so they cannot disagree).
+        self.engram_layout = (
+            EngramLayout.from_config(config)
+            if dsv41_engram_runtime_enabled(config)
+            else None
+        )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV41DecoderLayer(
@@ -1136,9 +1184,72 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                engram_layout=self.engram_layout,
             ),
             prefix=f"{prefix}.layers",
         )
+
+        # Serving-side n-gram hasher, built only when a LOCAL layer carries an
+        # engram (PP ranks without one need neither the tokenizer scan nor the
+        # per-token windows).
+        self.engram_hasher: EngramServingHasher | None = None
+        self._engram_token_windows: torch.Tensor | None = None
+        if self.engram_layout is not None and any(
+            getattr(layer, "engram", None) is not None
+            for layer in self.layers
+            if not isinstance(layer, PPMissingLayer)
+        ):
+            # The engram row gather is a host-side op (CPU tables + H2D of the
+            # gathered rows): it cannot run inside a captured CUDA graph. Fail
+            # loudly at boot instead of failing capture (or silently corrupting
+            # output with VLLM_DSV41_LOAD_ENGRAM=0). Speed work (host-fn gather
+            # inside graphs, as sglang does) comes after the correctness gate.
+            if (
+                not vllm_config.model_config.enforce_eager
+                and os.environ.get("VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH", "0") != "1"
+            ):
+                raise ValueError(
+                    "DeepSeek-V4.1-Flash engram is enabled (VLLM_DSV41_LOAD_"
+                    "ENGRAM=1, the default) but the engine is not running in "
+                    "eager mode. The engram's CPU-resident table gather cannot "
+                    "be captured in a CUDA graph yet: pass --enforce-eager "
+                    "(serve_v41.sh: DSV41_EAGER=1), or set "
+                    "VLLM_DSV41_LOAD_ENGRAM=0 to serve WITHOUT the engram "
+                    "(known token-level copy corruption)."
+                )
+            # Engram hashes recompute per-request trailing windows every step.
+            # The V2 model runner (forced for DSpark/MTP spec, i.e. the
+            # production config) gathers them ON-GPU from state kept current in
+            # stream order, so async scheduling is safe there. The V1 runner
+            # gathers them on the CPU from token_ids_cpu, which async
+            # scheduling leaves one step stale -- refuse that combination.
+            if (
+                vllm_config.scheduler_config.async_scheduling
+                and not vllm_config.use_v2_model_runner
+            ):
+                raise ValueError(
+                    "DeepSeek-V4.1-Flash engram on the V1 GPU model runner "
+                    "does not support async scheduling (which this build "
+                    "enables BY DEFAULT): the previous step's sampled tokens "
+                    "are not in token_ids_cpu yet when the next step's n-gram "
+                    "windows are gathered. Pass --no-async-scheduling, or set "
+                    "VLLM_DSV41_LOAD_ENGRAM=0 to serve WITHOUT the engram "
+                    "(known token-level copy corruption)."
+                )
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                vllm_config.model_config.tokenizer,
+                trust_remote_code=vllm_config.model_config.trust_remote_code,
+            )
+            self.engram_hasher = EngramServingHasher(
+                config,
+                self.engram_layout,
+                tokenizer,
+                image_token_id=(
+                    config.image_token_id if config.vision_enabled else None
+                ),
+            )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -1222,12 +1333,78 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        # Engram hash ids for every token of this batch, from the per-token
+        # trailing n-gram windows the runner gathered out of the persistent
+        # batch's full token history (NOT from input_ids: with multimodal
+        # support enabled the runner hands the model inputs_embeds and
+        # input_ids may be None; the windows also carry the predecessors of
+        # chunk-leading tokens that a prefix-cache hit skipped).
+        engram_hash_ids = engram_token_mask = None
+        if self.engram_hasher is not None:
+            num_tokens = positions.shape[0]
+            windows = self._engram_token_windows
+            if windows is None or windows.shape[0] < num_tokens:
+                # Profiling / dummy runs before the runner registered its
+                # window buffer: hash all-zero windows (valid table rows, so
+                # memory/comms are exercised; the outputs are discarded).
+                windows = torch.zeros(
+                    num_tokens,
+                    self.engram_hasher.layout.max_ngram_size,
+                    dtype=torch.int32,
+                    device=positions.device,
+                )
+            engram_hash_ids, engram_token_mask = self.engram_hasher(
+                windows[:num_tokens], positions
+            )
+
         residual, post_mix, res_mix, pre_mix = None, None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            if layer.engram is not None and engram_hash_ids is not None:
+                # Reference insertion point (inference/model.py:1288): the
+                # engram is applied to the multi-stream HC state h entering
+                # layer i, BEFORE the layer. The port DEFERS each sublayer's
+                # hc_post expansion: at this loop boundary the reference h
+                # exists only implicitly as the 4-tuple (hidden_states,
+                # residual, post_mix, res_mix) with
+                #   h == mhc_post(hidden_states, residual, post_mix, res_mix).
+                # The engram write is NONLINEAR in h (its gate is a sigmoid of
+                # a normalized <h, key> dot per hc copy) and adds the gated
+                # value into every copy, so the deferred form cannot be kept:
+                # materialize h with mhc_post_torch -- the exact same kernel
+                # (same FP reduction order) the layer itself would have used
+                # one call later, so the collapsed tensor is bit-identical to
+                # the tensor the reference engram sees -- apply the engram,
+                # and re-enter the layer through its residual=None path with
+                # the DEFERRED pre_mix carried over unchanged (the layer's
+                # attention still collapses with the previous FFN's pre, as
+                # in the reference).
+                from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
+
+                if residual is None:
+                    engram_h = hidden_states
+                else:
+                    engram_h = mhc_post_torch(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                engram_h = layer.engram(
+                    engram_h,
+                    engram_hash_ids[:, layer.engram.layer_hash_index],
+                    engram_token_mask,
+                )
+                if idx in self.aux_hidden_state_layers and aux_hidden_states:
+                    # The DSpark aux capture for THIS layer ran at the end of
+                    # the previous iteration, i.e. pre-engram. The reference
+                    # captures the target layer's attention input AFTER the
+                    # engram write (model.py:1288-1292) -- replace it. (Draft
+                    # numerics only affect acceptance rate, but stay faithful.)
+                    aux_hidden_states[-1] = engram_h.mean(dim=1)
+                hidden_states, residual, post_mix, res_mix = (
+                    engram_h, None, None, None
+                )
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
@@ -1328,6 +1505,13 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 ".compressor.wgate.weight"
             ):
                 name = name[: -len(".weight")]
+            # The global ``.scale`` -> ``.weight_scale_inv`` mapper rule is meant
+            # for the fp8 Linear layers (and fits engram.wkv.scale exactly), but
+            # it also renames the engram TABLE's e8m0 row scales. Those live on
+            # ParallelEngramEmbedding under their checkpoint name ``scale`` (with
+            # a row-shard / validate-only weight_loader) -- undo the rename.
+            if ".engram.embed." in name and name.endswith(".weight_scale_inv"):
+                name = name[: -len(".weight_scale_inv")] + ".scale"
             # Hybrid per-expert tensors (nvfp4_aqlm_hybrid) are stored at the
             # checkpoint-stable path ffn.experts.*; the runtime parameters live
             # on the MoERunner's RoutedExperts submodule. Remap and load them
@@ -1749,14 +1933,30 @@ class DeepseekV41ForCausalLM(
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
+    @property
+    def engram_window_size(self) -> int:
+        """Non-zero when the engram is wired: the runner must supply, per
+        scheduled token, a window of this many raw token ids ([token, pred_1,
+        .., pred_{n-1}]) gathered from the persistent batch's full per-request
+        token history (prefix-cache-skipped prompt tokens included)."""
+        hasher = getattr(self.model, "engram_hasher", None)
+        return hasher.layout.max_ngram_size if hasher is not None else 0
+
+    def set_engram_token_windows(self, windows_gpu: torch.Tensor) -> None:
+        """Register the runner's persistent [max_num_tokens, window] GPU buffer
+        of per-token n-gram windows (stable address; refreshed every step,
+        sliced to the batch inside forward)."""
+        self.model._engram_token_windows = windows_gpu
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # ``mtp.`` is skipped whenever speculative decoding is off (no draft
         # model built).
         skip = ["mtp."]
-        # The engram n-gram memory tables (layers 1, 14) are not yet wired as a
-        # module (CPU-offload seam pending); their checkpoint tensors have no
-        # home. Skip until the EngramTable is instantiated in the layer stack.
-        if os.environ.get("VLLM_DSV41_LOAD_ENGRAM", "0") != "1":
+        # Engram tensors load by DEFAULT into the layer-1/14 Engram modules
+        # (host-resident tables + GPU wkv/gates). VLLM_DSV41_LOAD_ENGRAM=0 is
+        # the kill-switch: it disables module construction (see
+        # dsv41_engram_runtime_enabled) and must skip the tensors here too.
+        if not dsv41_engram_runtime_enabled(self.config):
             skip += [".engram."]
         # The vision stack (``vision.`` tower, ``aligner.`` projector, ``image_*``
         # span delimiters, and the per-layer ``gate.bias_vl`` VL routing bias) now

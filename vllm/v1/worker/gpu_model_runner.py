@@ -739,6 +739,10 @@ class GPUModelRunner(
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        # DeepSeek-V4.1 engram: per-token trailing n-gram windows
+        # [max_num_tokens, engram_window_size]; allocated in load_model when the
+        # model requests them (see _setup_engram_token_windows).
+        self.engram_token_windows: CpuGpuBuffer | None = None
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -1022,6 +1026,27 @@ class GPUModelRunner(
             device=self.device,
             with_numpy=numpy,
         )
+
+    def _setup_engram_token_windows(self) -> None:
+        """DeepSeek-V4.1 engram: register a persistent per-token n-gram window
+        buffer with the model.
+
+        A model exposing a non-zero ``engram_window_size`` needs, for every
+        scheduled token, the raw ids ``[token, pred_1, .., pred_{n-1}]`` of its
+        trailing n-gram. They are gathered in ``_prepare_inputs`` from the
+        persistent batch's ``token_ids_cpu`` -- the request's FULL token history
+        -- so tokens skipped by a prefix-cache hit, accepted spec-decode tokens
+        and preemption-restored requests all hash correctly, with no decode-side
+        state to roll back after a rejected draft.
+        """
+        model = self.get_model()
+        window = getattr(model, "engram_window_size", 0)
+        if not window:
+            return
+        self.engram_token_windows = self._make_buffer(
+            self.max_num_tokens, window, dtype=torch.int32
+        )
+        model.set_engram_token_windows(self.engram_token_windows.gpu)
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
@@ -1979,6 +2004,32 @@ class GPUModelRunner(
                 token_indices_tensor,
                 out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
             )
+
+        # DeepSeek-V4.1 engram: gather each scheduled token's trailing n-gram
+        # window from the SAME full-history source as input_ids. Column 0 is the
+        # token itself; column s the id at position max(pos - s, 0) of the same
+        # request (the clamped duplicate at pos < s is substituted with the pad
+        # id by the hasher, which blocks look-back past the sequence start).
+        # Recomputing the windows from token_ids_cpu every step -- rather than
+        # carrying decode-side history -- makes prefix-cache hits, chunked
+        # prefill, preemption restarts and spec-decode draft rejection all
+        # correct by construction: the persistent batch already holds the
+        # authoritative token history at these positions.
+        if self.engram_token_windows is not None:
+            flat_token_ids = self.input_batch.token_ids_cpu_tensor.flatten()
+            windows_cpu = self.engram_token_windows.cpu
+            windows_cpu[:total_num_scheduled_tokens, 0] = self.input_ids.cpu[
+                :total_num_scheduled_tokens
+            ]
+            row_offsets = req_indices * self.input_batch.token_ids_cpu.shape[1]
+            for s in range(1, windows_cpu.shape[1]):
+                prev_indices = torch.from_numpy(
+                    np.maximum(positions_np - s, 0) + row_offsets
+                )
+                windows_cpu[:total_num_scheduled_tokens, s] = flat_token_ids[
+                    prev_indices
+                ]
+            self.engram_token_windows.copy_to_gpu(total_num_scheduled_tokens)
 
         # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
         # the InputBatch, we need to fill in the prompt embeds into the expected
@@ -5225,6 +5276,7 @@ class GPUModelRunner(
                         eplb_models += 1
 
                 self._setup_eagle3_aux_hidden_state_outputs()
+                self._setup_engram_token_windows()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the

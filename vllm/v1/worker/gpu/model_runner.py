@@ -240,6 +240,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+        # DeepSeek-V4.1 engram: persistent per-token n-gram window buffer
+        # [max_num_tokens, engram_window_size]; allocated in load_model when
+        # the model requests it (see _setup_engram_token_windows).
+        self.engram_token_windows: torch.Tensor | None = None
         if self.use_pp:
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
@@ -336,6 +340,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        self._setup_engram_token_windows()
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -1149,6 +1154,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
+    def _setup_engram_token_windows(self) -> None:
+        """DeepSeek-V4.1 engram: register a persistent per-token n-gram window
+        buffer with the model. Filled on-GPU in prepare_inputs (see
+        gather_token_windows_gpu) from ``req_states.all_token_ids.gpu`` /
+        ``input_ids``, which the V2 runner keeps current in stream order --
+        so prefix-cache hits, chunked prefill, spec-decode rollback AND async
+        scheduling are all handled without CPU-side history."""
+        model = self.model
+        window = getattr(model, "engram_window_size", 0)
+        if not window:
+            return
+        self.engram_token_windows = torch.zeros(
+            self.max_num_tokens, window, dtype=torch.int32, device=self.device
+        )
+        model.set_engram_token_windows(self.engram_token_windows)
+
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
     ) -> InputBatch:
@@ -1293,6 +1314,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "logits_idx=%s toks_at_idx=%s",
                     self.is_last_pp_rank, _nc, _qsl, _cul, _li, _toks,
                 )
+
+        # DeepSeek-V4.1 engram: input_ids is final now (prefill tokens, last
+        # sampled anchors and draft tokens are all in place) -- gather each
+        # token's trailing n-gram window on-GPU.
+        if self.engram_token_windows is not None:
+            from vllm.models.deepseek_v41.engram import gather_token_windows_gpu
+
+            gather_token_windows_gpu(
+                self.engram_token_windows,
+                self.input_buffers.input_ids,
+                self.input_buffers.positions,
+                self.input_buffers.query_start_loc,
+                idx_mapping,
+                self.req_states.all_token_ids.gpu,
+                num_tokens,
+                num_reqs,
+            )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]

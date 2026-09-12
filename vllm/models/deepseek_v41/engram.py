@@ -26,6 +26,10 @@ eager / piecewise region, never inside a captured FULL cudagraph (same disciplin
 indexer's python-metadata path).
 """
 
+import json
+import mmap
+import os
+import struct
 from dataclasses import dataclass
 
 import numpy as np
@@ -38,6 +42,18 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+
+
+def dsv41_engram_runtime_enabled(config) -> bool:
+    """Whether the serving engram is on: the checkpoint has engram layers AND the
+    ``VLLM_DSV41_LOAD_ENGRAM`` kill-switch (default ON) has not been set to 0.
+
+    Used by BOTH module construction and the weight-loader skip list so they can
+    never disagree (a module with skipped tensors would serve uninitialized
+    garbage; loaded tensors without a module would crash the loader)."""
+    return bool(getattr(config, "engram_layer_ids", None)) and (
+        os.environ.get("VLLM_DSV41_LOAD_ENGRAM", "1") == "1"
+    )
 
 
 def find_next_prime(start: int, seen_primes: set[int]) -> int:
@@ -164,6 +180,163 @@ class EngramLayout:
         )
 
 
+def build_hash_buffers(cfg, layout: "EngramLayout", tokenizer) -> dict:
+    """Shared constructor for the hash buffers (token map, multipliers, primes,
+    offsets, pad id). One implementation feeds both the reference-shaped
+    :class:`NgramHashState` (validation harness) and the serving
+    :class:`EngramServingHasher`, so they can never drift."""
+    ra = cfg.reference_args if hasattr(cfg, "reference_args") else cfg
+    # every hash multiplier derives from the compressed vocab size, so a mismatch
+    # there would silently rehash the whole table
+    token_map, vocab_size = build_compressed_token_map(tokenizer)
+    assert vocab_size == ra["engram_compressed_vocab_size"], (
+        vocab_size, ra["engram_compressed_vocab_size"])
+    multipliers = compute_hash_multipliers(
+        layout.layer_ids, layout.max_ngram_size, vocab_size)
+    flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
+    offsets = [np.cumsum([0, *sizes[:-1]]) for sizes in flat]
+    return {
+        "pad_id": token_map[ra["engram_pad_id"]],
+        "primes": torch.tensor(layout.primes),
+        "offsets": torch.tensor(np.array(offsets)),
+        "multipliers": multipliers,
+        "token_map": torch.tensor(token_map),
+    }
+
+
+def hash_ngram_windows(
+    tokens: torch.Tensor,
+    blocked: torch.Tensor,
+    pad_id: int,
+    token_map: torch.Tensor,
+    multipliers: torch.Tensor,
+    primes: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Hash per-token n-gram windows: ``tokens`` [T, n] carries raw token ids
+    (column 0 = the token itself, column s = its s-th predecessor); ``blocked``
+    [T, n] marks look-back that ran off the sequence start or crossed a dead
+    (image) token. Returns [T, n_engram_layers, (n-1)*n_heads] table row ids.
+
+    Bit-identical to :meth:`NgramHashState.forward` given the same windows: the
+    same compressed-map lookup, pad substitution, XOR-rolling multiply and
+    prime bucketing, just over stateless per-token windows instead of the
+    reference per-batch ring cache.
+    """
+    compressed = torch.where(blocked, pad_id, token_map[tokens])
+    products = compressed.unsqueeze(-2) * multipliers  # [T, n_layers, n]
+    # XOR the multiplied ids together one lookback at a time, so the running
+    # value after step i is the hash of the (i+1)-gram
+    rolling, hashes = products[..., 0], []
+    for i in range(1, tokens.shape[-1]):
+        rolling = torch.bitwise_xor(rolling, products[..., i])
+        hashes.append(rolling.unsqueeze(-1) % primes[:, i - 1])
+    return torch.cat(hashes, dim=-1) + offsets
+
+
+class EngramServingHasher(nn.Module):
+    """Serving-side hasher over per-token trailing windows.
+
+    The vLLM runner supplies, for every scheduled token, the window of raw ids
+    ``[token, pred_1, .., pred_{n-1}]`` gathered from the persistent batch's
+    ``token_ids_cpu`` (which always holds each request's FULL token history --
+    prompt tokens skipped by a prefix-cache hit, accepted spec tokens and
+    preemption-restored tokens included). Hashes are therefore a pure,
+    recomputed-every-step function of the sequence state: chunked prefill,
+    decode, prefix-cache hits and spec-decode rollback all fall out for free.
+
+    ``forward`` also returns the engram token mask (False on image-span
+    positions, whose gate the reference closes), or None for text-only configs.
+    """
+
+    def __init__(self, cfg, layout: EngramLayout, tokenizer,
+                 image_token_id: int | None = None):
+        super().__init__()
+        self.layout = layout
+        self.image_token_id = image_token_id
+        bufs = build_hash_buffers(cfg, layout, tokenizer)
+        self.pad_id = bufs["pad_id"]
+        self.register_buffer("primes", bufs["primes"], persistent=False)
+        self.register_buffer("offsets", bufs["offsets"], persistent=False)
+        self.register_buffer("multipliers", bufs["multipliers"], persistent=False)
+        self.register_buffer("token_map", bufs["token_map"], persistent=False)
+
+    @torch.inference_mode()
+    def forward(
+        self, windows: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """windows: [T, max_ngram_size] raw token ids (col 0 = current token);
+        positions: [T]. Returns ([T, n_layers, n_hash_cols], token_mask or None)."""
+        n = self.layout.max_ngram_size
+        # Clamp defensively: -1 spec-scheduler placeholders can only appear under
+        # async scheduling, which the engram wiring refuses at boot; a stray
+        # negative id must not crash the token_map gather.
+        tokens = windows[:, :n].to(torch.int64).clamp_min_(0)
+        shifts = torch.arange(n, device=tokens.device)
+        blocked = positions.to(torch.int64).unsqueeze(-1) < shifts
+        token_mask = None
+        if self.image_token_id is not None:
+            dead = tokens == self.image_token_id
+            token_mask = ~dead[:, 0]
+            # reference semantics: once a lookback hits a dead (image) token,
+            # every older predecessor is blocked too (sticky over shifts)
+            blocked = (blocked | dead).to(torch.int32).cummax(-1).values.bool()
+        hash_ids = hash_ngram_windows(
+            tokens, blocked, self.pad_id, self.token_map,
+            self.multipliers, self.primes, self.offsets)
+        return hash_ids, token_mask
+
+
+@torch.inference_mode()
+def gather_token_windows_gpu(
+    windows: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    num_tokens: int,
+    num_reqs: int,
+) -> None:
+    """Fill ``windows[:num_tokens]`` with each token's trailing n-gram window,
+    entirely on GPU (V2 model runner).
+
+    Predecessor at shift s of flat token t (position p, request row r):
+      * another token of the SAME batch run when it is at least s tokens into
+        its run -- read from ``input_ids`` (this covers chunk-internal
+        predecessors AND speculative draft tokens, which exist only in the
+        batch buffer at this point);
+      * otherwise a COMMITTED token -- read from ``all_token_ids[r, p - s]``,
+        which the V2 runner keeps current on-GPU in stream order (accepted
+        sampled tokens are written by post_update before the next step's
+        prepare kernels run, so async scheduling and spec-decode rollback are
+        both correct by construction; prompt rows hold the full prompt, so
+        prefix-cache hits are too).
+
+    ``windows`` is a persistent [max_num_tokens, n] int32 buffer; rows past
+    ``num_tokens`` are left stale (they are only ever read for cudagraph
+    padding rows, whose outputs are discarded -- the hash of any int32 id is a
+    valid table row).
+    """
+    device = windows.device
+    n = windows.shape[1]
+    t = torch.arange(num_tokens, device=device)
+    # batch row of each token: count of run boundaries <= t
+    bounds = query_start_loc[1 : num_reqs + 1].to(torch.int64)
+    batch_idx = torch.searchsorted(bounds, t, right=True).clamp_max(num_reqs - 1)
+    local = t - query_start_loc[batch_idx].to(torch.int64)
+    rows = idx_mapping[batch_idx].to(torch.int64)
+    pos = positions[:num_tokens].to(torch.int64)
+    max_len = all_token_ids.shape[1]
+    windows[:num_tokens, 0] = input_ids[:num_tokens]
+    for s in range(1, n):
+        from_batch = local >= s
+        in_batch = input_ids[(t - s).clamp_min(0)]
+        hist_pos = (pos - s).clamp(min=0, max=max_len - 1)
+        from_hist = all_token_ids[rows, hist_pos]
+        windows[:num_tokens, s] = torch.where(from_batch, in_batch, from_hist)
+
+
 class NgramHashState(nn.Module):
     """Maps each position to the hash ids of the n-grams ending there.
 
@@ -172,8 +345,8 @@ class NgramHashState(nn.Module):
     any dead token (an image span, cached as DEAD), so an n-gram never spans one.
 
     ``max_batch_size``/``max_seq_len`` size the reference-style ring cache used by the standalone
-    (non-paged) path and by the bit-exact validation harness. The serving runner may instead pass
-    complete per-request token windows to :meth:`hash_ids_for_window`.
+    (non-paged) path and by the bit-exact validation harness. Serving uses the stateless
+    :class:`EngramServingHasher` over runner-supplied per-token windows instead.
     """
 
     DEAD = -1
@@ -182,20 +355,12 @@ class NgramHashState(nn.Module):
                  max_seq_len: int = 4096):
         super().__init__()
         self.layout = layout
-        ra = cfg.reference_args if hasattr(cfg, "reference_args") else cfg
-        # every hash multiplier derives from the compressed vocab size, so a mismatch there
-        # would silently rehash the whole table
-        token_map, vocab_size = build_compressed_token_map(tokenizer)
-        assert vocab_size == ra["engram_compressed_vocab_size"], (
-            vocab_size, ra["engram_compressed_vocab_size"])
-        self.pad_id = token_map[ra["engram_pad_id"]]
-        multipliers = compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size)
-        flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
-        offsets = [np.cumsum([0, *sizes[:-1]]) for sizes in flat]
-        self.register_buffer("primes", torch.tensor(layout.primes), persistent=False)
-        self.register_buffer("offsets", torch.tensor(np.array(offsets)), persistent=False)
-        self.register_buffer("multipliers", multipliers, persistent=False)
-        self.register_buffer("token_map", torch.tensor(token_map), persistent=False)
+        bufs = build_hash_buffers(cfg, layout, tokenizer)
+        self.pad_id = bufs["pad_id"]
+        self.register_buffer("primes", bufs["primes"], persistent=False)
+        self.register_buffer("offsets", bufs["offsets"], persistent=False)
+        self.register_buffer("multipliers", bufs["multipliers"], persistent=False)
+        self.register_buffer("token_map", bufs["token_map"], persistent=False)
         self.register_buffer(
             "cache", torch.empty(max_batch_size, max_seq_len, dtype=torch.int64), persistent=False
         )
@@ -230,16 +395,64 @@ class NgramHashState(nn.Module):
         return torch.cat(hashes, dim=-1) + self.offsets
 
 
+_SAFETENSORS_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
+}
+
+
+def _mmap_checkpoint_tensor(
+    ckpt_dir: str, name: str, keep_alive: list
+) -> tuple[torch.Tensor, list[int]]:
+    """A zero-copy CPU view of one tensor inside a .safetensors shard.
+
+    The file is mapped MAP_PRIVATE (copy-on-write; nothing ever writes, so no
+    private pages materialize) and the tensor is a dtype view straight into the
+    page cache -- the fit lever for the two ~98 GB engram tables: no anonymous
+    host RAM is committed, the kernel pages rows in on demand and can evict them
+    under pressure. The mmap object is appended to ``keep_alive`` so the mapping
+    outlives this call. Returns (full_tensor, shape).
+    """
+    index = json.load(
+        open(os.path.join(ckpt_dir, "model.safetensors.index.json"))
+    )["weight_map"]
+    path = os.path.join(ckpt_dir, index[name])
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+        info = header[name]
+        data_start = 8 + header_len
+        mm = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_PRIVATE,
+                       prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    keep_alive.append(mm)
+    lo, hi = info["data_offsets"]
+    flat = torch.frombuffer(mm, dtype=torch.uint8, count=hi - lo,
+                            offset=data_start + lo)
+    dtype = _SAFETENSORS_DTYPES[info["dtype"]]
+    return flat.view(dtype).view(info["shape"]), info["shape"]
+
+
 class ParallelEngramEmbedding(nn.Module):
     """The n-gram hash table, sharded over its rows. Stays fp8: rows are dequantized on lookup.
 
     ``VLLM_DSV41_ENGRAM_DEVICE=cpu`` (default) keeps the ~49 GB/rank table in host DRAM; only the
     small gathered ``[.., n_hash_cols, head_dim]`` rows cross PCIe per token. Set to ``cuda`` to
     keep it resident (needs the 614 GB config; will not fit 4x96 GB).
+
+    Host-table backing (``table_source``):
+      * ``"mmap"`` (serving default) -- the weight/scale are dtype views straight
+        into the checkpoint shard's page cache (see :func:`_mmap_checkpoint_tensor`).
+        All ranks share one physical copy; the weight loader only VALIDATES the
+        checkpoint tensors (no 98 GB copy). Requires ``ckpt_dir``.
+      * ``"ram"`` -- each rank copies its row shard into (optionally pinned,
+        ``VLLM_DSV41_ENGRAM_PIN=1``) anonymous host memory at load time.
+        ~51 GB/rank for the two v41 tables; 4 ranks need ~203 GB host RAM.
+    The gather math and the TP all-reduce are identical in both modes.
     """
 
     def __init__(self, num_embeddings: int, dim: int, table_device: str = "cpu",
-                 block_size: int = 32):
+                 block_size: int = 32, table_source: str = "ram",
+                 ckpt_dir: str | None = None, ckpt_prefix: str | None = None):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.dim = dim
@@ -248,19 +461,69 @@ class ParallelEngramEmbedding(nn.Module):
         self.part_num_embeddings = (num_embeddings + world_size - 1) // world_size
         self.vocab_start_idx = rank * self.part_num_embeddings
         self.vocab_end_idx = self.vocab_start_idx + self.part_num_embeddings
+        # The ceil split can overrun the table on the last rank; allocate/map only
+        # the real rows. Indices are always < num_embeddings, so the mask math
+        # against vocab_end_idx never reaches the missing tail rows.
+        self.part_rows = max(
+            0, min(self.vocab_end_idx, num_embeddings) - self.vocab_start_idx
+        )
         self.world_size = world_size
         self.block_size = block_size
         self.table_device = table_device
-        self.weight = nn.Parameter(
-            torch.empty(self.part_num_embeddings, dim,
-                        dtype=torch.float8_e4m3fn, device=table_device),
-            requires_grad=False,
-        )
-        self.scale = nn.Parameter(
-            torch.empty(self.part_num_embeddings, dim // block_size,
-                        dtype=torch.float8_e8m0fnu, device=table_device),
-            requires_grad=False,
-        )
+        self.table_source = table_source
+        self._mmaps: list = []
+        if table_source == "mmap":
+            assert table_device == "cpu", "mmap tables are host-resident"
+            assert ckpt_dir is not None and ckpt_prefix is not None
+            full_w, w_shape = _mmap_checkpoint_tensor(
+                ckpt_dir, f"{ckpt_prefix}.weight", self._mmaps)
+            full_s, s_shape = _mmap_checkpoint_tensor(
+                ckpt_dir, f"{ckpt_prefix}.scale", self._mmaps)
+            assert w_shape == [num_embeddings, dim], (w_shape, num_embeddings, dim)
+            assert s_shape == [num_embeddings, dim // block_size], s_shape
+            rows = slice(self.vocab_start_idx, self.vocab_start_idx + self.part_rows)
+            self.weight = nn.Parameter(full_w[rows], requires_grad=False)
+            self.scale = nn.Parameter(full_s[rows], requires_grad=False)
+            # The tables are already backed by the checkpoint bytes: the weight
+            # loader must neither copy 98 GB nor let anything move them to GPU.
+            self.weight.weight_loader = self._validate_only_loader
+            self.scale.weight_loader = self._validate_only_loader
+        else:
+            pin = (table_device == "cpu"
+                   and os.environ.get("VLLM_DSV41_ENGRAM_PIN", "0") == "1")
+            self.weight = nn.Parameter(
+                torch.empty(self.part_rows, dim,
+                            dtype=torch.float8_e4m3fn, device=table_device,
+                            pin_memory=pin if table_device == "cpu" else False),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                torch.empty(self.part_rows, dim // block_size,
+                            dtype=torch.float8_e8m0fnu, device=table_device,
+                            pin_memory=pin if table_device == "cpu" else False),
+                requires_grad=False,
+            )
+            self.weight.weight_loader = self._row_shard_loader
+            self.scale.weight_loader = self._row_shard_loader
+
+    def _validate_only_loader(self, param: nn.Parameter,
+                              loaded_weight: torch.Tensor) -> None:
+        """mmap mode: the parameter already aliases the checkpoint bytes."""
+        expect = (self.num_embeddings, param.shape[-1])
+        if tuple(loaded_weight.shape) != expect:
+            raise ValueError(
+                f"engram table shape mismatch: checkpoint "
+                f"{tuple(loaded_weight.shape)} vs expected {expect}")
+
+    def _row_shard_loader(self, param: nn.Parameter,
+                          loaded_weight: torch.Tensor) -> None:
+        """ram mode: copy only this rank's rows (source stays mmap-backed)."""
+        if loaded_weight.shape[0] != self.num_embeddings:
+            raise ValueError(
+                f"engram table row mismatch: checkpoint {loaded_weight.shape[0]} "
+                f"vs config {self.num_embeddings}")
+        rows = slice(self.vocab_start_idx, self.vocab_start_idx + self.part_rows)
+        param.data.copy_(loaded_weight[rows])
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         compute_device = indices.device
@@ -313,7 +576,8 @@ class Engram(nn.Module):
     """
 
     def __init__(self, cfg, layer_id: int, layout: EngramLayout, wkv: nn.Module,
-                 table_device: str = "cpu"):
+                 table_device: str = "cpu", table_source: str = "ram",
+                 ckpt_dir: str | None = None, ckpt_prefix: str | None = None):
         super().__init__()
         ra = cfg.reference_args if hasattr(cfg, "reference_args") else cfg
         self.layer_id = layer_id
@@ -325,15 +589,20 @@ class Engram(nn.Module):
 
         self.embed = ParallelEngramEmbedding(
             layout.num_embeddings[self.layer_hash_index], layout.head_dim,
-            table_device=table_device)
+            table_device=table_device, table_source=table_source,
+            ckpt_dir=ckpt_dir,
+            ckpt_prefix=f"{ckpt_prefix}.embed" if ckpt_prefix else None)
         self.wkv = wkv  # Linear(n_hash_cols*head_dim -> dim*(hc_mult+1))
         self.q_weight = nn.Parameter(torch.ones(ra["hc_mult"], ra["dim"]), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(ra["hc_mult"], ra["dim"]), requires_grad=False)
 
     def forward(self, x: torch.Tensor, hash_ids: torch.Tensor,
                 token_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """x: [B, L, hc_mult, dim]; hash_ids: [B, L, n_hash_cols]; token_mask: [B, L]."""
+        """x: [B, L, hc_mult, dim] or [T, hc_mult, dim]; hash_ids: [.., n_hash_cols];
+        token_mask: [B, L] / [T] (True = text token whose gate may open)."""
         kv = self.wkv(self.embed(hash_ids).flatten(-2))
+        if isinstance(kv, tuple):  # vLLM Linear layers return (out, bias)
+            kv = kv[0]
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         return engram_gate(x, key, value, self.q_weight, self.k_weight,
