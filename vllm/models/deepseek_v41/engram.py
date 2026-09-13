@@ -76,6 +76,22 @@ def dsv41_engram_cudagraph_enabled(config) -> bool:
     )
 
 
+def dsv41_full_decode_enabled(config) -> bool:
+    """Whether decode-only FULL cudagraphs are on: the cudagraph-compatible
+    engram path is on AND ``VLLM_DSV41_FULL_DECODE=1`` (default OFF).
+
+    FULL_DECODE_ONLY captures the whole decoder forward in one graph for
+    uniform decode/verify batches (prefill stays eager, NONE), reclaiming the
+    host-side eager-break stitching idle that PIECEWISE leaves on the table.
+    Requires the engram consumer to read its persistent precomputed buffer
+    (guaranteed by the cudagraph engram path) and the decode candidate masks to
+    score a STATIC width (see build_decode_candidates) so no python-int seqlen
+    bakes a stale mask shape into the captured graph."""
+    return dsv41_engram_cudagraph_enabled(config) and (
+        os.environ.get("VLLM_DSV41_FULL_DECODE", "0") == "1"
+    )
+
+
 def find_next_prime(start: int, seen_primes: set[int]) -> int:
     """The smallest prime above ``start`` not already handed out."""
     from sympy import isprime
@@ -575,7 +591,23 @@ def engram_gate(x: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     x: [B, L, hc_mult, dim]; key: [B, L, hc_mult, dim]; value: [B, L, dim].
     Pure fp32 arithmetic (no quant) — signed-sqrt before sigmoid, matching the training kernel.
     Factored out of :class:`Engram.forward` so it can be validated bit-exact in isolation.
+
+    Long prefill chunks are tiled over the token dim: the fp32 transients here
+    (x.float() alone is 640 MiB at 8192 tokens) are the documented OOM at high
+    gpu-mem-utilization. All math is per-token, so tiling is bit-exact. Decode
+    batches (<= a few hundred tokens) take the untiled path unchanged.
     """
+    _TILE = 2048
+    if x.dim() == 3 and x.shape[0] > _TILE:
+        out = torch.empty_like(x)
+        for s in range(0, x.shape[0], _TILE):
+            e = min(s + _TILE, x.shape[0])
+            out[s:e] = engram_gate(
+                x[s:e], key[s:e], value[s:e], q_weight, k_weight, dim, eps,
+                clamp_value,
+                None if token_mask is None else token_mask[s:e],
+            )
+        return out
     weight = q_weight.float() * k_weight.float()  # only ever used as a product
     h = x.float()
     # normalized per (token, hc copy) over `dim`, NOT jointly over the copies

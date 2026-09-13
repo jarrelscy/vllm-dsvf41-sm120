@@ -684,6 +684,7 @@ def sparse_attn_indexer(
                     attn_metadata_narrowed.max_seq_len,
                     candidate_topk_blocks,
                     candidate_block_size,
+                    static_width=_cand.full_decode_static_width(),
                 )
             else:
                 keep = _cand.CANDIDATE_STORE.decode

@@ -75,6 +75,7 @@ from vllm.models.deepseek_v41.engram import (
     EngramServingHasher,
     dsv41_engram_cudagraph_enabled,
     dsv41_engram_runtime_enabled,
+    dsv41_full_decode_enabled,
     precompute_engram_gathered_rows,
 )
 from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
@@ -933,6 +934,55 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV41Attention]
     return DeepseekV41FlashMLAAttention
 
 
+def _hc_mixes3_fn(R, fn, scale, base, hc, hidden_size, rms_norm_eps, hc_eps,
+                  hc_post_alpha, sinkhorn_iters):
+    """Faithful port of gold hc_mixes + hc_split_sinkhorn (model.py / kernel.py).
+
+    R: [tok, hc_mult, hidden] -> (pre[tok,hc], post[tok,hc,1], comb[tok,hc,hc]),
+    all fp32. `pre` collapses the hc copies (deferred one sub-block); `post`/`comb`
+    expand the sublayer output back through hc_post.
+
+    Module-level (not a method) so every layer shares ONE compiled object under
+    VLLM_DSV41_COMPILE_HC=1."""
+    tok = R.shape[0]
+    x = R.reshape(tok, hc * hidden_size).float()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_norm_eps)
+    mixes = torch.matmul(x, fn.t()) * rsqrt
+    pre = torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + hc_eps
+    post = torch.sigmoid(
+        mixes[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc]
+    ) * hc_post_alpha
+    comb = mixes[:, 2 * hc :].view(tok, hc, hc) * scale[2] + base[2 * hc :].view(
+        1, hc, hc
+    )
+    comb = torch.softmax(comb, dim=-1) + hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
+    return pre, post.unsqueeze(-1), comb
+
+
+def _hc_collapse_fn(R, pre):
+    return (pre.unsqueeze(-1) * R.float()).sum(dim=1).to(R.dtype)
+
+
+if os.environ.get("VLLM_DSV41_COMPILE_HC", "0") == "1":
+    # dynamic shapes hit an inductor CantSplit codegen bug on this build (and
+    # vLLM's global combo_kernels config makes it worse) -- compile per-shape
+    # instead. Shapes seen are few: prefill chunk sizes + the decode capture
+    # sizes, all compiled once at boot/capture time.
+    import torch._dynamo
+    import torch._inductor.config as _inductor_cfg
+
+    torch._dynamo.config.cache_size_limit = max(
+        torch._dynamo.config.cache_size_limit, 256
+    )
+    _inductor_cfg.combo_kernels = False
+    _hc_mixes3_fn = torch.compile(_hc_mixes3_fn, dynamic=False, fullgraph=True)
+    _hc_collapse_fn = torch.compile(_hc_collapse_fn, dynamic=False, fullgraph=True)
+
+
 class DeepseekV41DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1040,33 +1090,15 @@ class DeepseekV41DecoderLayer(nn.Module):
         )
 
     def _hc_mixes3(self, R, fn, scale, base):
-        """Faithful port of gold hc_mixes + hc_split_sinkhorn (model.py / kernel.py).
-
-        R: [tok, hc_mult, hidden] -> (pre[tok,hc], post[tok,hc,1], comb[tok,hc,hc]),
-        all fp32. `pre` collapses the hc copies (deferred one sub-block); `post`/`comb`
-        expand the sublayer output back through hc_post."""
-        tok = R.shape[0]
-        hc = self.hc_mult
-        x = R.reshape(tok, hc * self.hidden_size).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        mixes = torch.matmul(x, fn.t()) * rsqrt
-        pre = torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + self.hc_eps
-        post = torch.sigmoid(
-            mixes[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc]
-        ) * self.hc_post_alpha
-        comb = mixes[:, 2 * hc :].view(tok, hc, hc) * scale[2] + base[2 * hc :].view(
-            1, hc, hc
+        return _hc_mixes3_fn(
+            R, fn, scale, base, self.hc_mult, self.hidden_size,
+            self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
         )
-        comb = torch.softmax(comb, dim=-1) + self.hc_eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        for _ in range(self.hc_sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        return pre, post.unsqueeze(-1), comb
 
     def _hc_collapse(self, R, pre):
         """Collapse hc copies into one, weighted by `pre`. [tok,hc,d] x [tok,hc]->[tok,d]."""
-        return (pre.unsqueeze(-1) * R.float()).sum(dim=1).to(R.dtype)
+        return _hc_collapse_fn(R, pre)
 
     def forward(
         self,
@@ -1229,20 +1261,39 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                         "back to --enforce-eager serving."
                     )
                 cg_mode = vllm_config.compilation_config.cudagraph_mode
+                # Decode-only FULL cudagraphs (VLLM_DSV41_FULL_DECODE=1): capture
+                # the whole decoder forward in one graph for uniform decode/verify
+                # batches and leave prefill eager (NONE). This is safe now that
+                # (1) the engram consumer reads a persistent precomputed buffer,
+                # (2) base DSA writes schedule_metadata in-place into a persistent
+                # buffer (DeepseekV32IndexerMetadataBuilder declares UNIFORM_BATCH
+                # FULL support), and (3) build_decode_candidates scores a STATIC
+                # width under this flag (device lens_row still neutralizes
+                # out-of-range columns, so the mask is bit-identical). Prefill
+                # keeps its .tolist() candidate/chunk path OUT of any graph, so
+                # only FULL_DECODE_ONLY is accepted -- FULL / FULL_AND_PIECEWISE
+                # would try to capture prefill and are still rejected.
+                full_decode = dsv41_full_decode_enabled(config)
                 if (
                     not vllm_config.model_config.enforce_eager
                     and cg_mode is not None
                     and cg_mode.has_mode(CUDAGraphMode.FULL)
+                    and not (
+                        full_decode and cg_mode == CUDAGraphMode.FULL_DECODE_ONLY
+                    )
                 ):
                     raise ValueError(
-                        "VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1 supports "
-                        "PIECEWISE cudagraphs only (got cudagraph_mode="
-                        f"{cg_mode}): the engram consumer is capturable, but "
-                        "FULL capture is not validated for this model (the "
-                        "sparse indexer's python-metadata path is not FULL-"
-                        "capturable either). Set "
+                        "VLLM_DSV41_ENGRAM_ALLOW_CUDAGRAPH=1 supports PIECEWISE "
+                        "cudagraphs (any mode), or FULL_DECODE_ONLY when "
+                        "VLLM_DSV41_FULL_DECODE=1 (decode captured FULL, prefill "
+                        f"eager); got cudagraph_mode={cg_mode} "
+                        f"(VLLM_DSV41_FULL_DECODE={'1' if full_decode else '0'}). "
+                        "Prefill's sparse-indexer python-metadata path (.tolist "
+                        "chunking) is not FULL-capturable, so FULL and "
+                        "FULL_AND_PIECEWISE are rejected. Set "
                         "--compilation-config '{\"cudagraph_mode\": "
-                        "\"PIECEWISE\"}'."
+                        "\"PIECEWISE\"}' or '{\"cudagraph_mode\": "
+                        "\"FULL_DECODE_ONLY\"}' (with VLLM_DSV41_FULL_DECODE=1)."
                     )
             elif not vllm_config.model_config.enforce_eager:
                 raise ValueError(

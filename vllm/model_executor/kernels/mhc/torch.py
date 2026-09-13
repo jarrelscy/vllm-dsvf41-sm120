@@ -104,3 +104,19 @@ def mhc_post_torch(
     )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
+
+
+# VLLM_DSV41_COMPILE_HC=1: fuse the HC glue with torch.compile. Every import
+# site (layer forward, engram materialization, mtp) picks up the SAME compiled
+# object, so the engram's materialized h and the layer's own mhc_post one call
+# later stay bit-identical (same kernels, same reduction order at same shapes).
+# Compiled Triton kernels replay inside FULL decode cudagraphs.
+import os as _os
+
+if _os.environ.get("VLLM_DSV41_COMPILE_HC", "0") == "1":
+    import torch._dynamo
+
+    torch._dynamo.config.cache_size_limit = max(
+        torch._dynamo.config.cache_size_limit, 256
+    )
+    mhc_post_torch = torch.compile(mhc_post_torch, dynamic=False, fullgraph=True)

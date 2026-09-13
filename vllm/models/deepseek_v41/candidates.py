@@ -58,6 +58,14 @@ def candidates_enabled() -> bool:
     return os.environ.get("VLLM_DSV41_CANDIDATES", "1") not in ("0", "false", "False")
 
 
+def full_decode_static_width() -> bool:
+    """Decode-only FULL cudagraphs (VLLM_DSV41_FULL_DECODE=1): score decode
+    candidates over the static full logits width so no python-int seqlen bakes a
+    stale mask shape into the captured graph. Read per op call (capture-time
+    under FULL); constant across a run so it never diverges capture vs replay."""
+    return os.environ.get("VLLM_DSV41_FULL_DECODE", "0") == "1"
+
+
 def candidate_keep_blocks(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,
@@ -263,6 +271,7 @@ def build_decode_candidates(
     max_seq_len: int,
     topk_blocks: int,
     block_size: int,
+    static_width: bool = False,
 ) -> torch.Tensor:
     """Source layer, decode/verify batch: block-keep masks ``[rows, nb]``.
 
@@ -273,14 +282,26 @@ def build_decode_candidates(
     covering plain decode, native spec-decode verify, and the flattened
     multi-token path alike). Only the first round_up(max_seq_len) columns are
     scored -- everything past that is invisible to every row.
+
+    ``static_width`` (decode-only FULL cudagraphs, VLLM_DSV41_FULL_DECODE=1):
+    score the FULL ``logits.size(-1)`` width instead of trimming to this step's
+    ``max_seq_len``. ``max_seq_len`` is a python int that grows every decode
+    step, so trimming would bake a stale mask shape into the captured graph.
+    The result is bit-identical -- ``_mask_unreachable`` sets every column
+    ``>= lens_row`` to -inf using the DEVICE ``lens_row`` tensor, so the extra
+    scored blocks come back -inf and are dropped by the ``> -inf`` topk filter.
+    Costs more compute at short context (why it is opt-in), free at long.
     """
     rows = logits.size(0)
     assert lens_row.numel() == rows, (
         f"candidate lens rows {lens_row.numel()} != logit rows {rows}"
     )
-    width = min(
-        -(-max(max_seq_len, 1) // block_size) * block_size, logits.size(-1)
-    )
+    if static_width:
+        width = logits.size(-1)
+    else:
+        width = min(
+            -(-max(max_seq_len, 1) // block_size) * block_size, logits.size(-1)
+        )
     masked = _mask_unreachable(logits[:, :width], lens_row.reshape(-1))
     return candidate_keep_blocks(
         masked, lens_row.reshape(-1, 1), topk_blocks, block_size
