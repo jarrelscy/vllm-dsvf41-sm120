@@ -297,29 +297,41 @@ def _process_image_blocks(
         elif block.get("type") == "text":
             text = block.get("text") or ""
             if IMAGE_PLACEHOLDER in text:
-                raise ValueError(
-                    f"Text block contains image placeholder '{IMAGE_PLACEHOLDER}': "
-                    f"'{text[:100]}'. Images should be separate content blocks."
-                )
+                block = copy.copy(block)
+                block["text"] = _defang_image_sp_tokens(text)
             new_blocks.append(block)
         else:
             new_blocks.append(block)
     return new_blocks, images
 
 
-def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
-    """Reject user-supplied image placeholder tokens in textual fields."""
-    content = msg.get("content")
-    if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
-        raise ValueError(
-            f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
-            "Images should be provided as image content blocks."
-        )
+def _defang_image_sp_tokens(text: str) -> str:
+    """Neutralize user-supplied image placeholder tokens in text.
+
+    A literal IMAGE_PLACEHOLDER in message text would tokenize to the image
+    special token (id 129264) and create a phantom image slot with no pixel
+    data behind it. Rewrite the fullwidth bars to ASCII so the string encodes
+    as plain text. Real placeholders are inserted only downstream of this, by
+    _process_image_blocks, so genuine image requests are unaffected.
+    """
+    return text.replace(IMAGE_PLACEHOLDER, "<|deepseek_image|>")
+
+
+def _sanitize_image_sp_tokens(msg: Dict[str, Any]) -> None:
+    """Defang image placeholder tokens in fields that can never carry images.
+
+    Flat string ``content`` must pass through VERBATIM: with the string
+    chat-content format (the serving default for this tokenizer mode, which
+    has no jinja template), chat_utils interpolates the real placeholder for
+    each attached image into the message text BEFORE the tokenizer runs, so a
+    placeholder here is normally a legitimate image marker. Text that arrives
+    as content blocks is defanged in _process_image_blocks instead, where real
+    images are still separate blocks and any placeholder in a text block is
+    therefore user-supplied.
+    """
     reasoning_content = msg.get("reasoning_content")
     if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
-        raise ValueError(
-            f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
-        )
+        msg["reasoning_content"] = _defang_image_sp_tokens(reasoning_content)
 
 
 def process_image_messages(
@@ -330,7 +342,7 @@ def process_image_messages(
     images: List[Dict[str, Any]] = []
     for msg in messages:
         msg = copy.deepcopy(msg)
-        _validate_no_image_sp_tokens(msg)
+        _sanitize_image_sp_tokens(msg)
 
         if isinstance(msg.get("content"), list) and "content_blocks" not in msg:
             msg["content_blocks"] = msg.pop("content")
