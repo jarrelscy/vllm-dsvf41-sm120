@@ -64,7 +64,18 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> None:
         super().__init__(c, layer_param_names)
         self.marlin_input_dtype = None
-        self.block_quant = self.config.weight_quant_key in {kFp8Static128BlockSym}
+        # Any 2D block-scaled fp8 weight works here, not just 128x128:
+        # prepare_fp8_layer_for_marlin converts block scales to marlin
+        # group-wise scales generically (group_size = weight_block_size[1],
+        # N-block -> per-channel expansion is exact). This admits e.g.
+        # DeepSeek-V4.1-Flash's 32x32 blocks, where marlin W8A16 keeps the
+        # checkpoint's exact quantization grid (lossless) while reading
+        # 1-byte weights -- unlike the triton W8A8 fallback.
+        _gs = c.weight_quant_key.scale.group_shape
+        self.block_quant = (
+            self.config.weight_quant_key in {kFp8Static128BlockSym}
+            or (_gs.row > 1 and _gs.col > 1)
+        )
         self.size_k_first = not self.block_quant
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

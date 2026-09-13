@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -17,6 +18,12 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+    CutlassFp8BlockScaledMMKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    TritonFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -48,6 +55,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -298,6 +306,23 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
 
+        # VLLM_DSV41_REBLOCK128=1: DeepSeek-V4.1-Flash ships 32x32 fp8 weight
+        # blocks / (1,32) activation groups, which no fast block-fp8 GEMM
+        # accepts (CUTLASS and DeepGEMM both require (1,128)) -- every fp8
+        # Linear lands on the slow triton kernel (~5-9x slower at decode M).
+        # With the flag on, weights are loaded at the checkpoint's 32-block
+        # geometry and REQUANTIZED to 128x128 blocks on-device in
+        # process_weights_after_loading, and quant keys/kernel selection use
+        # the 128 geometry (-> CutlassFp8BlockScaledMMKernel). Lossy at the
+        # scale-merge margin: MUST be gated (coherence + needle + golden diff).
+        self.reblock_source: list[int] | None = None
+        if (
+            os.environ.get("VLLM_DSV41_REBLOCK128", "0") == "1"
+            and self.weight_block_size == [32, 32]
+        ):
+            self.reblock_source = [32, 32]
+            self.weight_block_size = [128, 128]
+
         if self.block_quant:
             assert not self.act_q_static
             assert self.weight_block_size is not None
@@ -339,14 +364,39 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.block_quant:
             assert self.weight_block_size is not None
+            # VLLM_DSV41_REBLOCK128 per-layer opt-out: a (1,128) activation
+            # group needs the per-rank K divisible by 128 (e.g. the shared
+            # experts' down_proj has K=2304/4=576 -> impossible). Such layers
+            # keep the checkpoint's 32 geometry and the triton kernel. The
+            # method instance is per-layer, so reverting self here is safe.
+            if self.reblock_source is not None and (
+                input_size_per_partition % 128
+                # partial final N block: CUTLASS block kernel corrupts /
+                # rejects non-multiple-of-128 N (microbench: N=576 fails);
+                # keep such layers (wkv) on the 32/triton path.
+                or output_size_per_partition % 128
+            ):
+                self.weight_block_size = self.reblock_source
+                self.reblock_source = None
+                self.activation_quant_key = create_fp8_quant_key(
+                    static=self.act_q_static,
+                    group_shape=GroupShape(1, self.weight_block_size[0]),
+                )
+                self.weight_quant_key = create_fp8_quant_key(
+                    static=True, group_shape=GroupShape(*self.weight_block_size)
+                )
             layer.weight_block_size = self.weight_block_size
+            # Under VLLM_DSV41_REBLOCK128 validate against the checkpoint's
+            # SOURCE geometry: sharding happens on 32-block boundaries (the
+            # ckpt's real layout) and the 128 requant is per-rank post-load,
+            # so 128-divisibility of TP partitions is not required.
             validate_fp8_block_shape(
                 layer,
                 input_size,
                 output_size,
                 input_size_per_partition,
                 output_partition_sizes,
-                self.weight_block_size,
+                self.reblock_source or self.weight_block_size,
             )
 
         weight = create_fp8_weight_parameter(
@@ -367,11 +417,14 @@ class Fp8LinearMethod(LinearMethodBase):
         else:
             assert not self.act_q_static
             assert self.weight_block_size is not None
+            # Under VLLM_DSV41_REBLOCK128 the checkpoint scales are still the
+            # source 32x32 geometry: create the loadable param at that shape;
+            # process_weights_after_loading requantizes to the 128 target.
             scale = create_fp8_scale_parameter(
                 BlockQuantScaleParameter,
                 output_partition_sizes,
                 input_size_per_partition,
-                self.weight_block_size,
+                self.reblock_source or self.weight_block_size,
                 weight_loader,
                 scale_dtype=(torch.float8_e8m0fnu if self.is_scale_e8m0 else None),
             )
@@ -391,15 +444,119 @@ class Fp8LinearMethod(LinearMethodBase):
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
+            # Reblocked layers exist to hit the CUTLASS block kernel (the
+            # measured 5-9x over triton at decode M); force it rather than
+            # letting the priority list pick DeepGEMM, whose plain-fp8 SM120
+            # path is unproven here. Falls back to the normal list if CUTLASS
+            # can_implement rejects.
+            force_kernel=(
+                CutlassFp8BlockScaledMMKernel
+                if self.reblock_source is not None
+                # wo_a's raw block-fp8 weight is dequantized directly by
+                # bf16_o_proj (its GEMM never goes through this method), so
+                # marlin repacking it would corrupt that read. Pin it to the
+                # triton kernel, which leaves the raw layout in place.
+                else TritonFp8BlockScaledMMKernel
+                if (
+                    envs.VLLM_TEST_FORCE_FP8_MARLIN
+                    and getattr(layer, "prefix", "").endswith("wo_a")
+                )
+                else None
+            ),
         )
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+
+    def _reblock_weight_128(self, layer: torch.nn.Module) -> None:
+        """VLLM_DSV41_REBLOCK128: requantize a loaded 32x32-block fp8 weight to
+        128x128 blocks in place (dequant with the checkpoint's e8m0 32-block
+        scales -> per-128x128-block amax requant, fp32 scales). Runs on-device
+        at load; the fp32 transient is per-tensor (<=105 MB for wq_a) and freed
+        immediately. Lossy where a 128-block spans 32-blocks with very
+        different scales -- serve gates + golden diff decide acceptability."""
+        assert self.reblock_source == [32, 32]
+        src = 32
+        dst = 128
+        w = layer.weight
+        s = getattr(layer, "weight_scale_inv")
+        if s.dtype == torch.float8_e8m0fnu:
+            s = _upcast_e8m0_to_fp32(s)
+        else:
+            s = s.to(torch.float32)
+        n, k = w.shape
+        assert n % src == 0 and k % src == 0, (n, k)
+        # dequant
+        w32 = w.to(torch.float32) * s.repeat_interleave(src, 0)[
+            :n
+        ].repeat_interleave(src, 1)[:, :k]
+        # requant at 128x128
+        np_, kp = -(-n // dst) * dst, -(-k // dst) * dst
+        wpad = torch.nn.functional.pad(w32, (0, kp - k, 0, np_ - n))
+        blocks = wpad.view(np_ // dst, dst, kp // dst, dst)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        new_scale = (
+            blocks.abs().amax(dim=(1, 3)).to(torch.float32) / fp8_max
+        ).clamp_min(1e-12)
+        wq = (
+            (
+                wpad
+                / new_scale.repeat_interleave(dst, 0).repeat_interleave(dst, 1)
+            )
+            .clamp(-fp8_max, fp8_max)
+            .to(torch.float8_e4m3fn)[:n, :k]
+            .contiguous()
+        )
+        replace_parameter(layer, "weight", wq)
+        replace_parameter(layer, "weight_scale_inv", new_scale.contiguous())
+
+    def _marlin_kmerge_scales(self, layer: torch.nn.Module, target_k: int) -> None:
+        """VLLM_DSV41_MARLIN_KMERGE: merge 32-wide fp8 K-group scales up to
+        ``target_k`` (64/128) so marlin W8A16 has a valid thread config (its
+        table has no group-32 8-bit entry). NEAR-LOSSLESS: the merged scale is
+        the MAX of the merged e8m0 (power-of-two) scales, so each weight is
+        rescaled by an exact power of two -- bit-exact in fp8 except values
+        pushed into the subnormal range (bottom ~2 binades). The N dimension
+        keeps its 32-block granularity (expanded per-channel exactly by
+        prepare_fp8_layer_for_marlin). Activations stay bf16 (W8A16): no
+        activation quantization at all."""
+        src = 32
+        assert target_k % src == 0
+        f = target_k // src
+        w = layer.weight
+        s = getattr(layer, "weight_scale_inv")
+        if s.dtype == torch.float8_e8m0fnu:
+            s = _upcast_e8m0_to_fp32(s)
+        else:
+            s = s.to(torch.float32)
+        n, k = w.shape
+        nb, kb = s.shape
+        kb2 = -(-kb // f)
+        spad = torch.nn.functional.pad(s, (0, kb2 * f - kb), value=0.0)
+        snew = spad.view(nb, kb2, f).amax(-1)
+        # per-source-group rescale factor (power of two, <= 1)
+        ratio = (
+            spad.view(nb, kb2, f) / snew.unsqueeze(-1).clamp_min(1e-30)
+        ).view(nb, kb2 * f)[:, :kb]
+        w32 = w.to(torch.float32) * ratio.repeat_interleave(src, 0)[
+            :n
+        ].repeat_interleave(src, 1)[:, :k]
+        wq = w32.to(torch.float8_e4m3fn).contiguous()
+        replace_parameter(layer, "weight", wq)
+        replace_parameter(layer, "weight_scale_inv", snew.contiguous())
+        layer.weight_block_size = [src, target_k]
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.use_marlin:
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.
                 replace_parameter(layer, "weight", layer.weight.t())
+            kmerge = int(os.environ.get("VLLM_DSV41_MARLIN_KMERGE", "0"))
+            if (
+                kmerge
+                and self.block_quant
+                and getattr(layer, "weight_block_size", None) == [32, 32]
+            ):
+                self._marlin_kmerge_scales(layer, kmerge)
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
             # AttributeError if backend selection changes.
             if hasattr(self.fp8_linear, "marlin_input_dtype"):
@@ -411,6 +568,8 @@ class Fp8LinearMethod(LinearMethodBase):
         # TODO(rob): refactor block quant into separate class.
         if self.block_quant:
             assert not self.act_q_static
+            if self.reblock_source is not None:
+                self._reblock_weight_128(layer)
 
         # If checkpoint not serialized fp8, quantize the weights.
         else:
